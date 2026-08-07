@@ -377,9 +377,47 @@ def unwrap(r: dict) -> dict:
 
 
 async def get_spot(bk: Broker, symbol: str) -> float:
+    """
+    Last traded price.
+
+    The quote is nested under results[].quote, and there is no `mark_price` on
+    equities — reading the row directly returned None for every field and blew
+    up on float(None).
+
+    Two last-trade prices are published: the regular-session one and a
+    non-regular (extended-hours) one, each with its own venue timestamp. Take
+    whichever is more recent. That matters here specifically because the gamma
+    map is built pre-open, when the regular price is still yesterday's close
+    and the pre-market print is the honest number.
+    """
     r = unwrap(await bk.call("get_equity_quotes", {"symbols": [symbol]}))
-    q = r["results"][0]
-    return float(q.get("last_trade_price") or q.get("mark_price"))
+    rows = r.get("results") or []
+    if not rows:
+        raise Disconnected(f"{symbol}: empty quote response")
+    row = rows[0]
+    q = row.get("quote", row)
+
+    if q.get("has_traded") is False or (q.get("state") or "active") != "active":
+        log.warning("%s: quote state=%s has_traded=%s", symbol,
+                    q.get("state"), q.get("has_traded"))
+
+    best, best_ts = None, ""
+    for price_key, ts_key in (("last_trade_price", "venue_last_trade_time"),
+                              ("last_non_reg_trade_price",
+                               "venue_last_non_reg_trade_time")):
+        price, ts = q.get(price_key), q.get(ts_key) or ""
+        if price and ts >= best_ts:            # ISO-8601 sorts lexically
+            best, best_ts = price, ts
+
+    if best is None:                            # no print yet — use the book
+        bid, ask = q.get("bid_price"), q.get("ask_price")
+        if bid and ask and float(bid) > 0 and float(ask) > 0:
+            return (float(bid) + float(ask)) / 2
+        best = q.get("previous_close") or (row.get("close") or {}).get("price")
+
+    if best is None:
+        raise Disconnected(f"{symbol}: quote carried no usable price")
+    return float(best)
 
 
 async def fetch_bars(bk: Broker, symbol: str, days: int = 12) -> pd.DataFrame:
@@ -390,6 +428,11 @@ async def fetch_bars(bk: Broker, symbol: str, days: int = 12) -> pd.DataFrame:
         "start_time": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }))
     bars = r["results"][0]["bars"]
+    # Gap-fill bars are synthesized and carry no new information — keeping
+    # them would feed fabricated volume into the time-of-day baseline.
+    bars = [b for b in bars if not b.get("interpolated")]
+    if not bars:
+        raise Disconnected(f"{symbol}: no real bars returned")
     df = pd.DataFrame(bars)
     df["ts"] = (pd.to_datetime(df["begins_at"], utc=True)
                 .dt.tz_convert(TZ).dt.tz_localize(None))
@@ -448,8 +491,10 @@ async def all_strikes(bk: Broker, symbol: str, expiry: str, kind: str,
 
 async def list_expiries(bk: Broker, symbol: str) -> list[str]:
     """Available expiration dates on the chain."""
-    r = unwrap(await bk.call("get_option_chains", {"symbols": [symbol]}))
-    chains = r.get("results") or r.get("chains") or []
+    # The parameter is underlying_symbol, not symbols. Passing the wrong key
+    # meant this never returned a chain, so no expiry ever resolved.
+    r = unwrap(await bk.call("get_option_chains", {"underlying_symbol": symbol}))
+    chains = r.get("chains") or r.get("results") or []
     out: set[str] = set()
     for ch in chains:
         for d in (ch.get("expiration_dates") or []):
@@ -949,18 +994,53 @@ async def do_login() -> int:
         await cb.close()
 
     print("\nauthorized. credentials stored under", STATE_DIR / "oauth")
-
-    # Surface the two things that silently block live trading later.
-    for acct in (unwrap(accounts).get("results") or []):
-        num = acct.get("account_number", "?")
-        agentic = acct.get("agentic_allowed")
-        level = acct.get("option_level") or acct.get("max_option_level")
-        print(f"  account {num}  agentic_allowed={agentic}  option_level={level}")
-        if agentic is False:
-            print("    ! agentic access is OFF for this account — enable it in "
-                  "Robinhood before arming")
-    print("\nSet GEXBOT_ACCOUNT to the account number you want to trade.")
+    report_accounts(unwrap(accounts))
     return 0
+
+
+def report_accounts(payload: dict) -> None:
+    """
+    Surface the two settings that silently block live trading.
+
+    The response key is `accounts`, not `results` — reading the wrong one made
+    this print nothing at all, which looked like "no problems found".
+
+    This bot trades DEBIT SPREADS, which are multi-leg. Robinhood requires
+    options level 3 for spreads; level 2 covers long single-leg contracts and
+    covered calls only. An account that is agentic-enabled but level 2 will
+    take the connection happily and then reject every order.
+    """
+    rows = payload.get("accounts") or payload.get("results") or []
+    usable = []
+    print("\naccounts visible to this grant:")
+    for acct in rows:
+        if acct.get("deactivated") or acct.get("state") != "active":
+            continue
+        num = str(acct.get("account_number", "?"))
+        agentic = bool(acct.get("agentic_allowed"))
+        level = acct.get("option_level") or "(none)"
+        spreads = level in ("option_level_3", "option_level_4")
+        flag = "OK" if (agentic and spreads) else "  "
+        print(f"  {flag}  ••••{num[-4:]}  agentic={agentic}  {level}"
+              f"  {acct.get('brokerage_account_type','')}")
+        if agentic and spreads:
+            usable.append(num)
+
+    if usable:
+        print("\nSet GEXBOT_ACCOUNT to one of:", ", ".join(usable))
+        return
+
+    print("\n! NO ACCOUNT CAN TRADE SPREADS THROUGH THIS AGENT.")
+    print("  This bot opens debit spreads, which need options level 3.")
+    print("  An account needs BOTH agentic access AND level 3.")
+    agentic_any = [a for a in rows if a.get("agentic_allowed")]
+    if agentic_any:
+        print("  Agentic access is on, but the level is too low. Request an")
+        print("  options upgrade for that account in the Robinhood app.")
+    else:
+        print("  No account has agentic access. Enable it in Robinhood for the")
+        print("  account you want the bot to trade.")
+    print("  Paper mode is unaffected — it never places an order.")
 
 
 def do_auth_status() -> int:

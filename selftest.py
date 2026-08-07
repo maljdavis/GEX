@@ -568,6 +568,150 @@ def test_env_file(tmp) -> None:
           "a hand-run --login must not hide tokens from the service")
 
 
+# Real Robinhood responses, captured from the live API. Trimmed for length but
+# structurally verbatim — the nesting and key names are what matter, and every
+# parsing bug so far has been a wrong key read confidently.
+LIVE_EQUITY_QUOTE = {"results": [{
+    "quote": {"symbol": "SPY",
+              "last_trade_price": "773.200000",
+              "venue_last_trade_time": "2026-08-07T19:59:59.999402388Z",
+              "last_non_reg_trade_price": "772.870000",
+              "venue_last_non_reg_trade_time": "2026-08-07T20:44:59.961917697Z",
+              "previous_close": "768.560000", "bid_price": "772.830000",
+              "ask_price": "772.870000", "has_traded": True, "state": "active"},
+    "close": {"price": "768.56"}}]}
+
+LIVE_CHAINS = {"chains": [{"id": "c277b118", "symbol": "SPY",
+                           "expiration_dates": ["2026-08-07", "2026-08-10",
+                                                "2026-08-11", "2026-08-12"]}]}
+
+LIVE_BARS = {"results": [{"symbol": "SPY", "bars": [
+    {"begins_at": "2026-08-07T13:30:00Z", "open_price": "770.970000",
+     "close_price": "771.500000", "high_price": "771.620000",
+     "low_price": "770.630000", "volume": 604331, "session": "reg"},
+    {"begins_at": "2026-08-07T13:35:00Z", "open_price": "771.510000",
+     "close_price": "771.155000", "high_price": "771.547500",
+     "low_price": "770.680000", "volume": 233112, "session": "reg"},
+    {"begins_at": "2026-08-07T13:40:00Z", "open_price": "771.140000",
+     "close_price": "772.070000", "high_price": "772.090000",
+     "low_price": "770.880500", "volume": 0, "session": "reg",
+     "interpolated": True}]}]}
+
+LIVE_ACCOUNTS = {"accounts": [
+    {"account_number": "806712600", "agentic_allowed": False,
+     "option_level": "option_level_3", "state": "active", "deactivated": False,
+     "brokerage_account_type": "individual"},
+    {"account_number": "725679583", "agentic_allowed": True,
+     "option_level": "option_level_2", "state": "active", "deactivated": False,
+     "brokerage_account_type": "individual"},
+    {"account_number": "782260160", "agentic_allowed": True,
+     "option_level": "option_level_3", "state": "inactive", "deactivated": True,
+     "brokerage_account_type": "individual"}]}
+
+
+def test_broker_parsing(tmp) -> None:
+    """
+    Parse real API payloads. Each of these was a live crash or a silent
+    no-op — the quote nesting, the chains parameter name, and the accounts
+    key were all read wrongly and only surfaced against the real endpoint.
+    """
+    print("\nbroker response parsing")
+    os.environ["GEXBOT_HOME"] = str(tmp)
+    import importlib
+    import gexbot
+    importlib.reload(gexbot)
+
+    class FakeBroker:
+        def __init__(self, responses):
+            self.responses = responses
+            self.calls = []
+
+        async def call(self, tool, args, retries=3):
+            self.calls.append((tool, args))
+            return {"data": self.responses[tool]}
+
+    bk = FakeBroker({"get_equity_quotes": LIVE_EQUITY_QUOTE,
+                     "get_option_chains": LIVE_CHAINS,
+                     "get_equity_historicals": LIVE_BARS})
+
+    spot = asyncio.run(gexbot.get_spot(bk, "SPY"))
+    check("spot parses from nested quote", spot == 772.87, str(spot))
+    check("spot picks the more recent print", spot != 773.20,
+          "extended-hours print was newer than the regular-session one")
+
+    # no print at all -> midpoint, then prior close; never a crash
+    only_book = {"results": [{"quote": {"bid_price": "100.00",
+                                        "ask_price": "100.10"}}]}
+    bk2 = FakeBroker({"get_equity_quotes": only_book})
+    check("falls back to the midpoint",
+          asyncio.run(gexbot.get_spot(bk2, "SPY")) == 100.05)
+
+    bk3 = FakeBroker({"get_equity_quotes":
+                      {"results": [{"quote": {"previous_close": "99.50"}}]}})
+    check("falls back to the prior close",
+          asyncio.run(gexbot.get_spot(bk3, "SPY")) == 99.50)
+
+    bk4 = FakeBroker({"get_equity_quotes": {"results": [{"quote": {}}]}})
+    try:
+        asyncio.run(gexbot.get_spot(bk4, "SPY"))
+        check("unusable quote raises cleanly", False, "returned something")
+    except gexbot.Disconnected:
+        check("unusable quote raises cleanly", True,
+              "Disconnected, not TypeError: float() argument...")
+
+    exps = asyncio.run(gexbot.list_expiries(bk, "SPY"))
+    check("expiries parse from the chains key", exps == ["2026-08-07",
+          "2026-08-10", "2026-08-11", "2026-08-12"], str(exps))
+    tool, args = [c for c in bk.calls if c[0] == "get_option_chains"][0]
+    check("chains queried by underlying_symbol", "underlying_symbol" in args,
+          str(args))
+
+    bars = asyncio.run(gexbot.fetch_bars(bk, "SPY"))
+    check("bars parse", len(bars) == 2, f"{len(bars)} real bars")
+    check("interpolated bars dropped", 0 not in list(bars["volume"]),
+          "synthesized gap-fill would poison the volume baseline")
+    check("bar columns renamed",
+          list(bars.columns) == ["ts", "open", "high", "low", "close", "volume"])
+    check("timestamps converted to naive Central",
+          str(bars["ts"].iloc[0]) == "2026-08-07 08:30:00",
+          f"13:30Z -> {bars['ts'].iloc[0]} CT")
+
+
+def test_account_report(capsys_free=True) -> None:
+    """The options-level gate: spreads need level 3, not level 2."""
+    print("\naccount eligibility")
+    import io
+    import contextlib
+    import gexbot
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        gexbot.report_accounts(LIVE_ACCOUNTS)
+    out = buf.getvalue()
+
+    check("reads the accounts key", "••••2600" in out,
+          "not 'results' — that printed nothing at all")
+    check("account numbers masked", "806712600" not in out)
+    check("deactivated accounts skipped", "••••0160" not in out)
+    check("level-2 agentic account is not offered",
+          "Set GEXBOT_ACCOUNT to one of" not in out,
+          "agentic+level_2 cannot open spreads")
+    check("blocker is stated plainly", "NO ACCOUNT CAN TRADE SPREADS" in out)
+    check("names the actual fix", "options upgrade" in out)
+    check("says paper still works", "Paper mode is unaffected" in out)
+
+    ok = {"accounts": [{"account_number": "111122223333",
+                        "agentic_allowed": True, "option_level": "option_level_3",
+                        "state": "active", "deactivated": False}]}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        gexbot.report_accounts(ok)
+    out = buf.getvalue()
+    check("a valid account is offered", "Set GEXBOT_ACCOUNT to one of" in out)
+    check("offers the full number for config", "111122223333" in out,
+          "masked for display, full for GEXBOT_ACCOUNT")
+
+
 def test_exception_helpers() -> None:
     print("\nerror handling")
     import gexbot
@@ -619,6 +763,9 @@ def main() -> int:
         test_auth(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_env_file(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_broker_parsing(Path(d))
+    test_account_report()
     with tempfile.TemporaryDirectory() as d:
         test_session_roll(Path(d))
     with tempfile.TemporaryDirectory() as d:
