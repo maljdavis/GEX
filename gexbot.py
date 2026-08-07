@@ -176,15 +176,43 @@ class State:
         return cls()
 
     def roll(self) -> None:
+        """
+        New session. Reset the daily counters and drop yesterday's gamma maps
+        (open interest settled overnight, so they must be rebuilt).
+
+        OPEN POSITIONS ARE CARRIED. Wiping them was a real bug: with
+        trade_dte > 0 and hold_overnight set — the shipped default — the bot
+        forgot overnight holdings at the first cycle of the next day, so it
+        never managed or exited them and was free to open another on top. The
+        broker still has the position whatever this file says; forgetting it
+        doesn't close it, it just stops watching it.
+        """
         today = now().date().isoformat()
         if self.session_date == today:
             return
-        log.info("new session %s — resetting", today)
+
+        carried = {}
+        for name in list(self.symbols):
+            ss = self.sym(name)
+            if ss.position:
+                carried[name] = ss.position
+
+        log.info("new session %s — resetting%s", today,
+                 f", carrying {len(carried)} open position(s): "
+                 f"{', '.join(carried)}" if carried else "")
+
         self.session_date = today
         self.realized_today = 0.0
         self.halted = False
         self.halt_reason = ""
         self.symbols = {}
+
+        for name, pos in carried.items():
+            ss = self.sym(name)
+            ss.position = pos
+            self.put(ss)
+            journal("carried_position", symbol=name, **pos)
+
         self.save()
 
 
@@ -567,12 +595,22 @@ async def manage_position(bk: Broker, st: State, ss: SymbolState, armed: bool):
     pos["current_value"] = round(value, 2)
     pos["pnl_pct"] = round(pnl_pct, 1)
 
+    # Never carry a contract into expiration. hold_overnight switches off the
+    # daily force-flat, but "hold past today" must not mean "hold past expiry"
+    # — letting a spread expire turns a managed trade into assignment and
+    # pin risk. On expiry day the force-flat applies no matter what.
+    expiry = pos.get("expiry")
+    expiring_today = bool(expiry) and now().date().isoformat() >= str(expiry)[:10]
+    past_flat = now().time() >= PARAMS.force_flat
+
     reason = None
     if value >= pos["target"]:
         reason = "target"
     elif value <= pos["stop"]:
         reason = "stop"
-    elif now().time() >= PARAMS.force_flat and PARAMS.must_flatten_today():
+    elif past_flat and expiring_today:
+        reason = "expiry"
+    elif past_flat and PARAMS.must_flatten_today():
         reason = "time"
 
     log.info("%s holding %.2f  %+.1f%% (%+.0f)  %s",

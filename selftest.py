@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timedelta
 
@@ -434,6 +435,84 @@ def test_auth(tmp) -> None:
     check("logout clears credentials", st.status()["logged_in"] is False)
 
 
+def test_session_roll(tmp) -> None:
+    """
+    Regression: the daily reset used to wipe SymbolState wholesale, which
+    silently discarded open positions. With trade_dte>0 and hold_overnight —
+    the shipped default — that orphaned real holdings at the broker.
+    """
+    print("\nsession roll")
+    os.environ["GEXBOT_HOME"] = str(tmp)
+    import importlib
+    import gexbot
+    importlib.reload(gexbot)
+
+    st = gexbot.State()
+    st.session_date = "2026-01-05"
+    ss = st.sym("SPY")
+    ss.position = {"direction": "long", "quantity": 2, "entry_debit": 3.7,
+                   "expiry": "2026-01-06", "legs": [], "target": 7.0, "stop": 2.0}
+    ss.gamma_map = {"net_gex_musd": -400.0}
+    ss.trades_today = 1
+    st.put(ss)
+
+    qqq = st.sym("QQQ")
+    qqq.gamma_map = {"net_gex_musd": 120.0}
+    qqq.trades_today = 1
+    st.put(qqq)
+
+    st.realized_today = -120.0
+    st.halted = True
+    st.roll()                                    # simulates the next morning
+
+    carried = st.sym("SPY")
+    check("open position survives the roll", carried.position is not None,
+          "the broker still holds it whatever this file says")
+    check("carried position keeps its legs",
+          carried.position and carried.position["quantity"] == 2)
+    check("carried position keeps its expiry",
+          carried.position.get("expiry") == "2026-01-06")
+    check("stale gamma map is dropped", not carried.gamma_map,
+          "OI settled overnight — the map must be rebuilt")
+    check("trade budget resets", carried.trades_today == 0)
+    check("flat symbol is cleared", not st.sym("QQQ").gamma_map)
+    check("daily P&L resets", st.realized_today == 0.0)
+    check("halt clears for the new day", st.halted is False)
+
+    # and it must round-trip through disk, since the daemon reloads on restart
+    st.save()
+    again = gexbot.State.load()
+    check("carried position survives a restart",
+          again.sym("SPY").position is not None,
+          "systemd restarts must not orphan a live position")
+
+
+def test_expiry_flatten(tmp) -> None:
+    """A contract must never be carried into expiration."""
+    print("\nexpiry force-flat")
+    os.environ["GEXBOT_HOME"] = str(tmp)
+    import importlib
+    import gexbot
+    importlib.reload(gexbot)
+
+    src = inspect_source(gexbot.manage_position)
+    check("expiry checked against today's date", "expiring_today" in src)
+    check("expiry flatten ignores hold_overnight",
+          "past_flat and expiring_today" in src,
+          "hold past today must not mean hold past expiry")
+    check("exit reason distinguishes expiry", '"expiry"' in src)
+
+    p_hold = S.Params(trade_dte=3, hold_overnight=True)
+    check("hold_overnight disables the daily flatten",
+          not p_hold.must_flatten_today(),
+          "which is exactly why the expiry check has to be separate")
+
+
+def inspect_source(fn) -> str:
+    import inspect
+    return inspect.getsource(fn)
+
+
 def test_exception_helpers() -> None:
     print("\nerror handling")
     import gexbot
@@ -477,6 +556,10 @@ def main() -> int:
         test_journal_tail(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_auth(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_session_roll(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_expiry_flatten(Path(d))
     test_exception_helpers()
 
     print()
