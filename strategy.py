@@ -33,6 +33,7 @@ Direction = Literal["long", "short"]
 Regime = Literal["positive", "negative"]
 Setup = Literal["breakout", "reversion"]
 Structure = Literal["spread", "single"]
+Moneyness = Literal["itm", "atm", "otm"]
 
 
 # ─────────────────────────── frozen parameters ───────────────────────────
@@ -65,6 +66,21 @@ class Params:
     # entry logic with a different instrument — the checklist does not change.
     structure: Structure = "spread"
 
+    # Where the long strike sits relative to spot.
+    #
+    #   itm  cheapest breakeven, most premium per contract
+    #   atm  middle
+    #   otm  cheapest per contract, furthest breakeven
+    #
+    # Read the tradeoff honestly: on the tested sample direction was right ~71%
+    # of the time while an ATM 0DTE contract won only 35%, because breakeven
+    # sat above the median winning move. OTM pushes breakeven further still, so
+    # it needs a bigger move to pay — it buys affordability with win rate, it
+    # does not buy an edge. On a small account it is often the only way to hold
+    # a single contract at all, which is a real reason to use it; "it's cheap"
+    # is not.
+    moneyness: Moneyness = "itm"
+
     # 01 — EMA stack
     ema_fast: int = 9
     ema_mid: int = 21
@@ -91,14 +107,40 @@ class Params:
 
     # 04 — risk
     rr_min: float = 2.0
-    risk_per_trade_pct: float = 0.01      # 1% of account; spec allows up to 2%
+
+    # ── sizing ────────────────────────────────────────────────────────
+    # Two different numbers, kept separate because conflating them is how
+    # people get surprised:
+    #
+    #   alloc_pct  how much of the account is SPENT on premium
+    #   risk       what is LOST if the stop hits = alloc_pct * stop_pct
+    #
+    # Allocation is the control; risk is its consequence. Deploying 80% with a
+    # 45% stop risks 36% of the account on one trade — roughly, two stop-outs
+    # halve it and three leave a third. That is a bet-sizing choice, not
+    # position sizing, and it is only survivable because max_trades_per_day is
+    # 1 and the daily loss limit halts the session.
+    #
+    # 1% risk — the checklist default — is unusable on a small account: 1% of
+    # $1,000 is $10, which at a 45% stop buys $0.22 of premium. No contract
+    # exists at that price, so the bot would never trade at all.
+    alloc_pct: float = 0.10               # fraction of account deployed as premium
+
+    # Optional second ceiling on loss-at-stop. None means allocation alone
+    # governs. Set it only if you want a cap tighter than alloc_pct * stop_pct.
+    risk_per_trade_pct: Optional[float] = None
+
+    max_contracts: int = 20               # backstop against a fat-fingered debit
     max_stop_distance_pct: float = 0.01   # reject absurdly wide structural stops
     max_trades_per_day: int = 1
 
     def __post_init__(self):
         assert self.ema_fast < self.ema_mid < self.ema_slow
         assert self.rr_min >= 2.0, "checklist floor is 1:2"
-        assert 0 < self.risk_per_trade_pct <= 0.02
+        assert 0 < self.alloc_pct <= 0.95, "allocation must be within (0, 95%]"
+        assert self.risk_per_trade_pct is None or 0 < self.risk_per_trade_pct <= 1.0
+        assert self.max_contracts >= 1
+        assert self.moneyness in ("itm", "atm", "otm")
         assert 0 <= self.trade_dte <= 45
         assert self.map_dte_max >= 0
         assert self.structure in ("spread", "single")
@@ -107,7 +149,7 @@ class Params:
         """0DTE must be closed before expiry. Longer-dated need not be."""
         return self.trade_dte == 0 or not self.hold_overnight
 
-    def itm_offset(self, spot: float) -> int:
+    def strike_offset(self, spot: float) -> int:
         """
         How deep ITM the long leg sits, in points.
 
@@ -130,6 +172,20 @@ class Params:
         if self.trade_dte <= 2:
             return max(1, round(base * 0.6))
         return max(1, round(base * 0.35))
+
+    def strike_for(self, spot: float, direction: Direction) -> int:
+        """
+        The long strike, given moneyness.
+
+        A call is ITM below spot and OTM above it; a put is the mirror. One
+        signed offset covers all six combinations.
+        """
+        if self.moneyness == "atm":
+            return round(spot)
+        sign = -1 if self.moneyness == "itm" else 1
+        if direction == "short":                    # puts mirror calls
+            sign = -sign
+        return round(spot) + sign * self.strike_offset(spot)
 
     def spread_width(self, spot: float) -> int:
         """Wider spreads for longer DTE — the move has more room to develop."""
@@ -556,9 +612,11 @@ def evaluate(bar: pd.Series, symbol: str, zones: dict, net_gex: float,
             ev.target = round(spot + risk * p.rr_min if direction == "long"
                               else spot - risk * p.rr_min, 2)
 
+    _sz = sizing_summary(account_value, 0.45, p)
     add(Check(S, "position_sized", account_value > 0,
-              f"{p.risk_per_trade_pct:.0%} of {account_value:,.0f} "
-              f"= ${account_value * p.risk_per_trade_pct:,.0f} max risk"))
+              f"deploy up to ${_sz['max_deployed']:,.0f} of {account_value:,.0f} "
+              f"({p.alloc_pct:.0%}); ~${_sz['loss_at_stop']:,.0f} "
+              f"({_sz['loss_at_stop_pct']:.0f}%) at the stop"))
     add(Check(S, "structural_stop", risk_ok,
               f"stop {ev.stop} ({stop_source})" if risk_ok
               else "no structural level to anchor to"))
@@ -588,10 +646,36 @@ def scan_session(bars: pd.DataFrame, symbol: str, zones: dict, net_gex: float,
 
 def size_position(account_value: float, entry_debit: float, stop_pct: float,
                   p: Params = PARAMS) -> int:
-    """Contracts such that hitting the stop costs no more than risk_per_trade_pct."""
-    if entry_debit <= 0 or stop_pct <= 0:
+    """
+    How many contracts to buy.
+
+    Bounded by allocation (premium spent), optionally by a loss-at-stop cap,
+    and always by max_contracts. Returns 0 when even one contract exceeds the
+    allocation — the caller logs that rather than quietly buying one anyway,
+    because "just one" on a small account can be most of it.
+    """
+    if entry_debit <= 0 or stop_pct <= 0 or account_value <= 0:
         return 0
-    return max(0, int((account_value * p.risk_per_trade_pct) / (entry_debit * 100 * stop_pct)))
+    cost = entry_debit * 100                       # one contract, in dollars
+    qty = int(account_value * p.alloc_pct / cost)
+    if p.risk_per_trade_pct is not None:
+        qty = min(qty, int(account_value * p.risk_per_trade_pct / (cost * stop_pct)))
+    return max(0, min(qty, p.max_contracts))
+
+
+def sizing_summary(account_value: float, stop_pct: float,
+                   p: Params = PARAMS) -> dict:
+    """What the settings actually permit, for logging before the open."""
+    deploy = account_value * p.alloc_pct
+    implied = p.alloc_pct * stop_pct
+    if p.risk_per_trade_pct is not None:
+        implied = min(implied, p.risk_per_trade_pct)
+    return {
+        "max_deployed": round(deploy, 2),
+        "max_premium_one_contract": round(deploy / 100, 2),
+        "loss_at_stop": round(account_value * implied, 2),
+        "loss_at_stop_pct": round(implied * 100, 1),
+    }
 
 
 if __name__ == "__main__":

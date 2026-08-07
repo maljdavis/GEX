@@ -287,3 +287,30 @@ programmatic access through the agentic endpoint.
 Last end-to-end run against 4,368 real SPY bars: 276 flags, 58 compressions,
 871 long / 800 short confirmation candles, swing stop available on 100% of
 bars, 13-check evaluation serializing cleanly to dashboard and journal.
+
+---
+
+## Sizing on a small account
+
+`alloc_pct` is the control; loss-at-stop is its consequence:
+
+```
+loss at stop = alloc_pct x stop_pct        (stop_pct = 0.45)
+```
+
+80% deployed risks 36% of the account on one trade. Two stop-outs roughly
+halve it, three leave a third. That is bet sizing, not position sizing, and it
+survives only because `max_trades_per_day` is 1 and the daily stop halts the
+session — so set `GEXBOT_DAILY_STOP` *below* one stop-out or it can never fire.
+
+The 1% checklist default is unusable below roughly $25k: 1% of $1,000 is $10,
+which at a 45% stop buys $0.22 of premium. No contract exists at that price, so
+the bot never trades. `risk_per_trade_pct` therefore defaults to None — an
+optional second ceiling rather than the primary control.
+
+None of the Evidence above was measured at this allocation. Those simulations
+sized at 1% of a funded account, where a stop-out is a rounding error and the
+edge (if any) compounds across many trades. At 36% per trade the same
+distribution of outcomes produces a very different path: the arithmetic that
+matters is no longer the mean return but the chance of ruin before the sample
+gets large enough to mean anything. Nothing here measures that.

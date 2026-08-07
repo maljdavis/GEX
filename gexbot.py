@@ -29,6 +29,7 @@ import sys
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -47,7 +48,7 @@ import auth as _auth
 
 from strategy import (PARAMS as _DEFAULT_PARAMS, VERSION, add_indicators,
                       build_zones, daily_bias, evaluate, pick_expiries,
-                      regime_of, size_position)
+                      regime_of, size_position, sizing_summary)
 from strategy import Params
 from dashboard import serve as serve_dashboard, tail_journal
 
@@ -72,7 +73,28 @@ def _params_from_env() -> Params:
         if v not in ("spread", "single"):
             sys.exit(f"GEXBOT_STRUCTURE must be 'spread' or 'single', got {v!r}")
         over["structure"] = v
+    if v := os.environ.get("GEXBOT_MONEYNESS"):
+        v = v.strip().lower()
+        if v not in ("itm", "atm", "otm"):
+            sys.exit(f"GEXBOT_MONEYNESS must be itm, atm or otm, got {v!r}")
+        over["moneyness"] = v
+    if v := os.environ.get("GEXBOT_ALLOC_PCT"):
+        over["alloc_pct"] = _fraction(v, "GEXBOT_ALLOC_PCT")
+    if v := os.environ.get("GEXBOT_RISK_PCT"):
+        over["risk_per_trade_pct"] = _fraction(v, "GEXBOT_RISK_PCT")
+    if v := os.environ.get("GEXBOT_MAX_CONTRACTS"):
+        over["max_contracts"] = int(v)
     return _dc.replace(_DEFAULT_PARAMS, **over) if over else _DEFAULT_PARAMS
+
+
+def _fraction(raw: str, name: str) -> float:
+    """Accept either 0.8 or 80 — both obviously mean 80%."""
+    v = float(raw.strip().rstrip("%"))
+    if v > 1:
+        v /= 100
+    if not 0 < v <= 1:
+        sys.exit(f"{name} must be a fraction of the account, got {raw!r}")
+    return v
 
 
 def _load_env_file() -> None:
@@ -156,6 +178,13 @@ logging.basicConfig(
               logging.FileHandler(STATE_DIR / "gexbot.log")],
 )
 log = logging.getLogger("gexbot")
+
+# The SDK logs a line per HTTP request and reconnects the optional GET stream
+# every second because Robinhood answers it 405 — thousands of lines a session,
+# burying the ones that matter. Warnings and errors still come through.
+for _noisy in ("httpx", "httpx2", "httpcore", "httpcore2",
+               "mcp.client.streamable_http", "mcp.client.auth"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 def now() -> datetime:
@@ -490,7 +519,14 @@ async def all_strikes(bk: Broker, symbol: str, expiry: str, kind: str,
         nxt = page.get("next")
         if not nxt:
             break
-        cursor = nxt.split("cursor=")[1].split("&")[0]
+        # The cursor is percent-encoded inside the next URL. Slicing the raw
+        # string handed back an encoded value and the API answered
+        # 404 "Invalid cursor", which killed the whole gamma map build.
+        cursor = parse_qs(urlsplit(nxt).query).get("cursor", [None])[0]
+        if not cursor:
+            log.warning("%s %s: unparseable next cursor, stopping at %d strikes",
+                        symbol, kind, len(out))
+            break
     return out
 
 
@@ -639,10 +675,15 @@ async def open_position(bk: Broker, st: State, ss: SymbolState, ev, armed: bool)
         log.warning("%s: no trade expiry resolved", ss.symbol)
         return
 
-    offset = int(ITM_OFFSET_OVERRIDE) if ITM_OFFSET_OVERRIDE else PARAMS.itm_offset(spot)
     width = int(SPREAD_WIDTH_OVERRIDE) if SPREAD_WIDTH_OVERRIDE else PARAMS.spread_width(spot)
 
-    long_k = round(spot) - offset if direction == "long" else round(spot) + offset
+    if ITM_OFFSET_OVERRIDE:                     # explicit points ITM, legacy knob
+        off = int(ITM_OFFSET_OVERRIDE)
+        long_k = round(spot) - off if direction == "long" else round(spot) + off
+    else:
+        long_k = PARAMS.strike_for(spot, direction)
+    # The short leg always sits further out than the long one, in the direction
+    # the trade profits — that is what makes it a debit vertical.
     short_k = None if single else (long_k + width if direction == "long"
                                    else long_k - width)
 
@@ -887,31 +928,39 @@ class Runner:
         st = State.load()
         self.state = st
 
-        try:
-            await serve_dashboard(self.build_state, port=DASH_PORT,
-                                  host=DASH_HOST, token=DASH_TOKEN)
-        except Exception as e:
-            log.error("dashboard did not start: %s", e)
-            log.error("trading continues — the UI is optional, the bot is not")
+        asyncio.create_task(self.serve_dashboard_forever())
 
         log.info("watching %s | strategy v%s | %s %dDTE | %s",
                  ",".join(SYMBOLS), VERSION, PARAMS.structure, PARAMS.trade_dte,
                  "LIVE" if self.armed else "PAPER")
 
-        # Say up front what the risk budget can actually afford. Otherwise the
-        # first sign of trouble is a skipped entry at 08:35 on the one morning
-        # the checklist finally goes green.
-        budget = ACCOUNT_VALUE * PARAMS.risk_per_trade_pct
-        max_premium = budget / (100 * STOP_PCT)
-        log.info("risk %.0f%% of $%s = $%.0f per trade; at a %.0f%% stop the most "
-                 "one contract may cost is $%.2f",
-                 PARAMS.risk_per_trade_pct * 100, f"{ACCOUNT_VALUE:,.0f}", budget,
-                 STOP_PCT * 100, max_premium)
-        if PARAMS.structure == "single" and max_premium < 3.0:
-            log.warning("a single long option on SPY usually costs more than "
-                        "$%.2f — expect entries to be skipped. Raise "
-                        "GEXBOT_ACCOUNT_VALUE if it understates the account, "
-                        "trade QQQ instead, or use spreads.", max_premium)
+        # Say up front what the settings actually permit. Otherwise the first
+        # sign of trouble is a skipped entry at 08:35 on the one morning the
+        # checklist finally goes green.
+        sz = sizing_summary(ACCOUNT_VALUE, STOP_PCT, PARAMS)
+        log.info("sizing: %s %s | deploy up to $%s of $%s (%.0f%%) "
+                 "= max $%.2f premium per contract, up to %d contracts",
+                 PARAMS.moneyness, PARAMS.structure,
+                 f"{sz['max_deployed']:,.0f}", f"{ACCOUNT_VALUE:,.0f}",
+                 PARAMS.alloc_pct * 100, sz["max_premium_one_contract"],
+                 PARAMS.max_contracts)
+        log.info("a stop-out costs $%s (%.0f%% of the account); daily limit $%s "
+                 "halts after %s",
+                 f"{sz['loss_at_stop']:,.0f}", sz["loss_at_stop_pct"],
+                 f"{DAILY_LOSS_LIMIT:,.0f}",
+                 "one such loss" if DAILY_LOSS_LIMIT <= sz["loss_at_stop"]
+                 else f"{DAILY_LOSS_LIMIT / max(sz['loss_at_stop'], 1):.1f} of them")
+
+        if sz["loss_at_stop_pct"] >= 20:
+            log.warning("this risks %.0f%% of the account on a single trade — "
+                        "two stop-outs roughly halve it. Deliberate on a "
+                        "challenge account; check GEXBOT_ALLOC_PCT if not.",
+                        sz["loss_at_stop_pct"])
+        if DAILY_LOSS_LIMIT >= ACCOUNT_VALUE * 0.5:
+            log.warning("GEXBOT_DAILY_STOP ($%s) is %.0f%% of the account — it "
+                        "will never halt anything. Set it below one stop-out.",
+                        f"{DAILY_LOSS_LIMIT:,.0f}",
+                        DAILY_LOSS_LIMIT / ACCOUNT_VALUE * 100)
 
         backoff = 5
         while not self.stop.is_set():
@@ -942,6 +991,33 @@ class Runner:
                 backoff = min(backoff * 2, 300)
 
         log.info("stopped cleanly")
+
+    async def serve_dashboard_forever(self) -> None:
+        """
+        Keep trying to bind the dashboard.
+
+        A single attempt at startup meant that anything transiently holding the
+        port — a leftover process, an SSH forward — cost you the UI until the
+        next restart, with only one log line an hour earlier to explain it.
+        Trading is unaffected either way; the bot is not optional, the UI is.
+        """
+        delay = 15
+        while not self.stop.is_set():
+            try:
+                await serve_dashboard(self.build_state, port=DASH_PORT,
+                                      host=DASH_HOST, token=DASH_TOKEN)
+                log.info("dashboard listening on %s:%d", DASH_HOST, DASH_PORT)
+                return
+            except OSError as e:
+                log.warning("dashboard could not bind %s:%d (%s) — retrying in %ds. "
+                            "Something else is using the port; `ss -ltnp | grep %d` "
+                            "names it, or set GEXBOT_DASH_PORT.",
+                            DASH_HOST, DASH_PORT, e, delay, DASH_PORT)
+            except Exception as e:
+                log.error("dashboard failed to start: %s", e)
+                return                          # config error — retrying won't help
+            await self.sleep(delay)
+            delay = min(delay * 2, 300)
 
     async def serve_connection(self, st: State) -> None:
         """
@@ -1140,10 +1216,26 @@ def main() -> None:
     if armed and not ACCOUNT:
         sys.exit("Refusing to arm: GEXBOT_ACCOUNT is not set.")
 
-    r = Runner(armed)
-    signal.signal(signal.SIGINT, r.request_stop)
-    signal.signal(signal.SIGTERM, r.request_stop)
-    asyncio.run(r.run())
+    asyncio.run(_run(Runner(armed)))
+
+
+async def _run(r: "Runner") -> None:
+    """
+    Install signal handlers on the running loop.
+
+    signal.signal() sets the stop event but does NOT wake a selector that is
+    blocked in epoll, so a shutdown arriving during a long backoff sleep went
+    unnoticed until systemd's TimeoutStopSec expired and SIGKILLed the process
+    mid-cycle. loop.add_signal_handler wakes the loop through its self-pipe, so
+    the stop lands immediately.
+    """
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, r.request_stop)
+        except NotImplementedError:             # non-POSIX
+            signal.signal(sig, r.request_stop)
+    await r.run()
 
 
 if __name__ == "__main__":

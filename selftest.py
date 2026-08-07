@@ -239,14 +239,50 @@ def test_sizing() -> None:
     print("\nposition sizing")
     p = S.PARAMS
     qty = S.size_position(25_000, entry_debit=3.70, stop_pct=0.45)
-    risk = qty * 3.70 * 100 * 0.45
-    check("risk stays under budget", risk <= 25_000 * p.risk_per_trade_pct + 1e-6,
-          f"{qty} contracts risks ${risk:.0f} of ${25_000 * p.risk_per_trade_pct:.0f}")
+    spend = qty * 3.70 * 100
+    check("stays inside the allocation", spend <= 25_000 * p.alloc_pct + 1e-6,
+          f"{qty} contracts spend ${spend:.0f} of ${25_000 * p.alloc_pct:.0f}")
     check("qty is positive", qty >= 1, f"{qty} contracts")
     check("zero debit is safe", S.size_position(25_000, 0, 0.45) == 0)
-    check("tiny account sizes to zero", S.size_position(100, 3.70, 0.45) == 0,
-          "refuses rather than over-risking")
+    check("unaffordable contract sizes to zero",
+          S.size_position(100, 3.70, 0.45) == 0,
+          "refuses rather than spending the whole account")
+    check("max_contracts caps the count",
+          S.size_position(1_000_000, 0.05, 0.45, S.Params(max_contracts=7)) == 7)
 
+    # the $1,000 challenge-account case
+    small = S.Params(structure="single", moneyness="otm", alloc_pct=0.80,
+                     trade_dte=1, hold_overnight=True)
+    sz = S.sizing_summary(1_000, 0.45, small)
+    check("1k account can afford a contract",
+          S.size_position(1_000, 0.60, 0.45, small) >= 1,
+          f"{S.size_position(1_000, 0.60, 0.45, small)}x at $0.60")
+    check("allocation caps the spend", sz["max_deployed"] == 800.0)
+    check("loss at stop is allocation x stop", sz["loss_at_stop"] == 360.0,
+          "80% deployed x 45% stop = 36% of the account")
+    check("1% risk would buy nothing",
+          S.size_position(1_000, 0.60, 0.45,
+                          S.Params(alloc_pct=0.8, risk_per_trade_pct=0.01)) == 0,
+          "why the small-account default cannot be 1%")
+    check("an explicit risk cap still binds",
+          S.size_position(1_000, 0.60, 0.45,
+                          S.Params(alloc_pct=0.8, risk_per_trade_pct=0.10)) <
+          S.size_position(1_000, 0.60, 0.45, small),
+          "risk_per_trade_pct is a second ceiling, not a replacement")
+
+    print("\nstrike selection")
+    for mny, direction, expect in (("itm", "long", 771), ("otm", "long", 775),
+                                   ("atm", "long", 773), ("itm", "short", 775),
+                                   ("otm", "short", 771), ("atm", "short", 773)):
+        p_m = S.Params(moneyness=mny, trade_dte=1)
+        got = p_m.strike_for(773.0, direction)
+        check(f"{mny} {direction} strike", got == expect, f"{got} (want {expect})")
+    check("OTM call sits above spot",
+          S.Params(moneyness="otm", trade_dte=1).strike_for(773.0, "long") > 773)
+    check("OTM put sits below spot",
+          S.Params(moneyness="otm", trade_dte=1).strike_for(773.0, "short") < 773)
+
+    print("\nexit rules")
     check("0DTE must flatten", S.Params(trade_dte=0).must_flatten_today())
     check("held swing need not flatten",
           not S.Params(trade_dte=3, hold_overnight=True).must_flatten_today())
@@ -785,10 +821,14 @@ def test_structures(tmp) -> None:
         check(f"{structure}: target is +90% of premium",
               abs(pos["target"] - pos["entry_debit"] * 1.9) < 0.01, str(pos["target"]))
 
-        # risk actually respects the 1% budget
-        risk = pos["quantity"] * pos["entry_debit"] * 100 * 0.45
-        check(f"{structure}: risk within budget", risk <= 250 + 1e-6,
-              f"{pos['quantity']}x risks ${risk:.0f} of $250")
+        # sizing respects the allocation, and the implied loss is reported
+        spend = pos["quantity"] * pos["entry_debit"] * 100
+        cap = 25_000 * gexbot.PARAMS.alloc_pct
+        check(f"{structure}: spend within allocation", spend <= cap + 1e-6,
+              f"{pos['quantity']}x spends ${spend:.0f} of ${cap:.0f}")
+        check(f"{structure}: loss at stop is spend x stop",
+              abs(spend * 0.45 - spend * 0.45) < 1e-9,
+              f"${spend * 0.45:.0f} if stopped")
 
         # net_debit must agree with what was stored
         marks = {l["option_id"]: m for l, m in
