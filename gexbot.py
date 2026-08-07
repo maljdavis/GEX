@@ -1007,6 +1007,13 @@ class Runner:
                 await serve_dashboard(self.build_state, port=DASH_PORT,
                                       host=DASH_HOST, token=DASH_TOKEN)
                 log.info("dashboard listening on %s:%d", DASH_HOST, DASH_PORT)
+                if DASH_TOKEN:
+                    # Deliberately not logging the token itself — journald
+                    # persists and gets shipped places the env file doesn't.
+                    log.info("dashboard needs its token: open "
+                             "http://127.0.0.1:%d/?k=$(grep GEXBOT_DASH_TOKEN "
+                             "/opt/gexbot/gexbot.env | cut -d= -f2). Without "
+                             "?k=... every request returns 401.", DASH_PORT)
                 return
             except OSError as e:
                 log.warning("dashboard could not bind %s:%d (%s) — retrying in %ds. "
