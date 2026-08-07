@@ -25,6 +25,11 @@ from aiohttp import web
 
 TZ = ZoneInfo("America/Chicago")
 
+# Bump when the page layout changes. It renders in the header, so "did my
+# upgrade actually reach the browser" is answerable by looking, instead of by
+# guessing whether the deploy or the cache is at fault.
+UI_VERSION = "3"
+
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -95,7 +100,7 @@ h1{font-size:15px;letter-spacing:.22em;text-transform:uppercase;font-weight:600}
 </head>
 <body>
 <div class="top">
-  <h1>gexbot</h1>
+  <h1>gexbot <span style="font-size:9px;letter-spacing:.1em;color:var(--muted)">UI __UI_VERSION__</span></h1>
   <div id="status"></div>
 </div>
 <div class="phase" id="phase"></div>
@@ -293,8 +298,54 @@ safeTick(); setInterval(safeTick, 3000);
 </html>"""
 
 
+def resolve_host(host: str) -> str:
+    """
+    Turn GEXBOT_DASH_HOST into an address to bind.
+
+    "tailscale" resolves to this machine's tailnet address, which is the point:
+    binding that interface means the page is reachable from your phone and
+    laptop anywhere, and from nowhere else. 0.0.0.0 on a VPS would also bind
+    the public IP, where a shared token is all that stands between the internet
+    and a page showing your positions.
+    """
+    if host != "tailscale":
+        return host
+    import shutil
+    import subprocess
+    exe = shutil.which("tailscale") or "/usr/bin/tailscale"
+    try:
+        out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True,
+                             timeout=10)
+        ip = (out.stdout or "").strip().splitlines()
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ValueError(f"GEXBOT_DASH_HOST=tailscale but tailscale failed: {e}. "
+                         f"Install it and run `tailscale up`, or set an "
+                         f"explicit address.") from e
+    if not ip:
+        raise ValueError("GEXBOT_DASH_HOST=tailscale but this machine has no "
+                         "tailnet address. Run `tailscale up` first.")
+    return ip[0].strip()
+
+
+def classify(host: str) -> str:
+    """loopback | private | public — decides how much protection is required."""
+    import ipaddress
+    if host in ("0.0.0.0", "::"):
+        return "public"                 # binds every interface, public IP included
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return "public"                 # a name we can't vouch for
+    if addr.is_loopback:
+        return "loopback"
+    # 100.64/10 is CGNAT, which is what Tailscale hands out.
+    if addr.is_private or addr in ipaddress.ip_network("100.64.0.0/10"):
+        return "private"
+    return "public"
+
+
 async def serve(state_getter, port: int = 8787, host: str = "127.0.0.1",
-                token: str | None = None):
+                token: str | None = None, allow_public: bool = False):
     """
     state_getter() -> dict with: now, heartbeat_age_s, armed, spot, gamma_map,
     evaluation, position, trades_today, max_trades, halted, halt_reason, log
@@ -303,14 +354,32 @@ async def serve(state_getter, port: int = 8787, host: str = "127.0.0.1",
             "0.0.0.0"   = reachable from the network. REQUIRES a token.
     token : shared secret. Passed as ?k=... once, then stored in a cookie.
 
-    This page exposes positions and account state. Binding to 0.0.0.0 without
-    a token is refused rather than warned about — an open port on a VM gets
-    found by scanners within hours.
+    This page exposes positions and account state, so the bind address is
+    policed rather than warned about — an open port on a VM gets found by
+    scanners within hours:
+
+        loopback   no token needed; reachable only through an SSH tunnel
+        private    token required; Tailscale and LAN addresses land here
+        public     refused unless allow_public is set explicitly
+
+    0.0.0.0 counts as public because on a VPS it binds the public IP too. A
+    shared token is fine for keeping a page private on a tailnet; it is not
+    what should stand between the internet and a funded account.
     """
-    if host != "127.0.0.1" and not token:
+    host = resolve_host(host)
+    kind = classify(host)
+
+    if kind != "loopback" and not token:
         raise ValueError(
             f"refusing to bind {host} without a token. "
             f"Set GEXBOT_DASH_TOKEN, or use an SSH tunnel / Tailscale instead."
+        )
+    if kind == "public" and not allow_public:
+        raise ValueError(
+            f"refusing to bind {host} — that is reachable from the internet, "
+            f"and this page shows your positions. Use Tailscale "
+            f"(GEXBOT_DASH_HOST=tailscale) or an SSH tunnel. If you really "
+            f"mean it, set GEXBOT_DASH_ALLOW_PUBLIC=yes."
         )
 
     app = web.Application()
@@ -332,8 +401,15 @@ async def serve(state_getter, port: int = 8787, host: str = "127.0.0.1",
 
     app.middlewares.append(auth)
 
+    page = PAGE.replace("__UI_VERSION__", UI_VERSION)
+
     async def index(_):
-        return web.Response(text=PAGE, content_type="text/html")
+        # no-store, or a browser serves a cached copy after an upgrade and the
+        # page silently stays on the old layout — indistinguishable from the
+        # deploy not having happened.
+        return web.Response(text=page, content_type="text/html",
+                            headers={"Cache-Control": "no-store, must-revalidate",
+                                     "Pragma": "no-cache"})
 
     async def api_state(_):
         return web.json_response(state_getter())

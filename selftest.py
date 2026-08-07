@@ -509,6 +509,60 @@ def test_dashboard_render(ev: S.Evaluation, zones: dict) -> None:
         loop.call_soon_threadsafe(loop.stop)
 
 
+def test_bind_policy() -> None:
+    """
+    Which addresses the dashboard will bind. This page shows positions, so a
+    mistake here is the one that matters most in the whole repo.
+    """
+    print("\ndashboard bind policy")
+    import dashboard
+
+    for host, kind in (("127.0.0.1", "loopback"), ("::1", "loopback"),
+                       ("100.101.102.103", "private"),   # tailscale CGNAT
+                       ("10.0.0.5", "private"), ("192.168.1.10", "private"),
+                       ("172.16.0.9", "private"),
+                       ("0.0.0.0", "public"), ("::", "public"),
+                       ("46.202.178.135", "public"),
+                       ("gexbot.example.com", "public")):
+        got = dashboard.classify(host)
+        check(f"{host} is {kind}", got == kind, got)
+
+    def refuses(**kw):
+        try:
+            asyncio.run(dashboard.serve(lambda: {}, port=8794, **kw))
+            return False
+        except ValueError:
+            return True
+
+    check("public bind refused even with a token",
+          refuses(host="0.0.0.0", token="x" * 20),
+          "0.0.0.0 on a VPS binds the public IP")
+    check("public IP refused with a token",
+          refuses(host="46.202.178.135", token="x" * 20))
+    check("private bind refused without a token",
+          refuses(host="100.101.102.103"))
+    check("hostname treated as public",
+          refuses(host="gexbot.example.com", token="x" * 20),
+          "cannot vouch for what a name resolves to")
+
+    # explicit opt-in is the only way past it
+    import inspect
+    src = inspect.getsource(dashboard.serve)
+    check("opt-in exists and is explicit", "allow_public" in src)
+    check("opt-in is off by default",
+          inspect.signature(dashboard.serve).parameters["allow_public"].default
+          is False)
+
+    # tailscale resolution fails loudly rather than silently binding wide
+    try:
+        dashboard.resolve_host("tailscale")
+        check("tailscale resolution attempted", True, "tailscale is present")
+    except ValueError as e:
+        check("missing tailscale raises, never falls back",
+              "tailscale" in str(e).lower(),
+              "a silent fallback to 0.0.0.0 would be the dangerous bug")
+
+
 def test_journal_tail(tmp) -> None:
     print("\njournal")
     import dashboard
@@ -1063,6 +1117,7 @@ def main() -> int:
     test_daily_bias()
     test_dashboard(ev, zones)
     test_dashboard_render(ev, zones)
+    test_bind_policy()
     with tempfile.TemporaryDirectory() as d:
         test_journal_tail(Path(d))
     with tempfile.TemporaryDirectory() as d:

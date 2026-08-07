@@ -169,6 +169,8 @@ JOURNAL = STATE_DIR / "journal.ndjson"
 DASH_PORT = int(os.environ.get("GEXBOT_DASH_PORT", "8787"))
 DASH_HOST = os.environ.get("GEXBOT_DASH_HOST", "127.0.0.1")
 DASH_TOKEN = os.environ.get("GEXBOT_DASH_TOKEN") or None
+DASH_ALLOW_PUBLIC = os.environ.get("GEXBOT_DASH_ALLOW_PUBLIC", "").lower() in (
+    "1", "true", "yes")
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -1073,7 +1075,8 @@ class Runner:
         while not self.stop.is_set():
             try:
                 await serve_dashboard(self.build_state, port=DASH_PORT,
-                                      host=DASH_HOST, token=DASH_TOKEN)
+                                      host=DASH_HOST, token=DASH_TOKEN,
+                                      allow_public=DASH_ALLOW_PUBLIC)
                 log.info("dashboard listening on %s:%d", DASH_HOST, DASH_PORT)
                 if DASH_TOKEN:
                     # Deliberately not logging the token itself — journald
