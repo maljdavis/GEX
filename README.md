@@ -44,12 +44,32 @@ in `gexbot.py`.
 ```
 08:25   resolve expiries · build the aggregate gamma map · freeze zones · daily bias
 08:35   scan every 30s — each bar runs all 13 checks
-A+      open a debit spread, direction from the EMA stack
+A+      open the trade, direction from the EMA stack
 holding manage every 10s → target +90% / stop −45% / force-flat (0DTE only)
 always  journal every evaluation, passing or failing
 ```
 
-No time-based exit. Hold to target, stop, or close.
+No time-based exit. Hold to target, stop, or close. A contract is always
+flattened on its expiry date regardless of the hold setting.
+
+### What it buys
+
+`GEXBOT_STRUCTURE` picks the instrument. The entry logic is identical either
+way — same gamma zones, same 13 checks, same stop and target percentages on
+premium.
+
+| | `spread` | `single` |
+|---|---|---|
+| Instrument | debit vertical | one long call or put |
+| Options level | **3** | **2** |
+| Cost per contract | net of two legs | full premium |
+| Theta | partly hedged | full |
+| Upside | capped at the width | uncapped |
+| Tested in `HANDOFF.md` | yes | no |
+
+Singles cost more per contract, so 1% risk buys fewer of them — on a small
+account, possibly none. The bot logs the maximum affordable premium at startup;
+if entries get skipped with "risk budget too small", that line is why.
 
 ---
 

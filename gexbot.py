@@ -67,6 +67,11 @@ def _params_from_env() -> Params:
         over["map_dte_max"] = int(v)
     if os.environ.get("GEXBOT_HOLD_OVERNIGHT", "").lower() in ("1", "true", "yes"):
         over["hold_overnight"] = True
+    if v := os.environ.get("GEXBOT_STRUCTURE"):
+        v = v.strip().lower()
+        if v not in ("spread", "single"):
+            sys.exit(f"GEXBOT_STRUCTURE must be 'spread' or 'single', got {v!r}")
+        over["structure"] = v
     return _dc.replace(_DEFAULT_PARAMS, **over) if over else _DEFAULT_PARAMS
 
 
@@ -585,19 +590,51 @@ async def find_contract(bk: Broker, symbol: str, expiry: str,
     return inst[0]["id"] if inst else None
 
 
+def net_debit(marks: dict[str, float], legs: list[dict]) -> float:
+    """
+    What the package is worth right now.
+
+    Bought legs add, sold legs subtract. One expression covers a single long
+    option and a vertical spread, so entry, management, and exit don't each
+    need to know which structure is open.
+    """
+    return sum((1 if leg["side"] == "buy" else -1) * marks[leg["option_id"]]
+               for leg in legs)
+
+
+async def quote_marks(bk: Broker, ids: list[str]) -> dict[str, float]:
+    r = unwrap(await bk.call("get_option_quotes", {"instrument_ids": ids}))
+    marks = {}
+    for row in r.get("results", []):
+        q = row.get("quote", row)
+        mark = q.get("mark_price") or q.get("adjusted_mark_price")
+        if mark is not None:
+            marks[q["instrument_id"]] = float(mark)
+    missing = [i for i in ids if i not in marks]
+    if missing:
+        raise Disconnected(f"no mark price for {len(missing)} leg(s)")
+    return marks
+
+
 async def open_position(bk: Broker, st: State, ss: SymbolState, ev, armed: bool):
     """
-    Debit spread, long leg ITM.
+    Open the structure the config asks for, long leg ITM either way.
 
     ITM rather than ATM deliberately: on the tested sample, direction was right
     ~71% of the time but an ATM 0DTE contract only won 35%, because breakeven
     sat above the median winning move. ITM pulls breakeven down to where the
     signal actually delivers.
+
+    "single" buys one call (long bias) or one put (short bias). Same checklist,
+    same zone, same stop and target arithmetic on premium — only the instrument
+    differs. It needs options level 2 rather than level 3, and its upside is
+    uncapped, at the cost of full theta with no short leg to offset it.
     """
     direction = ev.direction
     kind = "call" if direction == "long" else "put"
     spot = ev.spot
-    expiry = ss.trade_expiry or ss.gamma_map.get("expiries", [None])[0]
+    single = PARAMS.structure == "single"
+    expiry = ss.trade_expiry or (ss.gamma_map.get("expiries") or [None])[0]
     if not expiry:
         log.warning("%s: no trade expiry resolved", ss.symbol)
         return
@@ -605,54 +642,60 @@ async def open_position(bk: Broker, st: State, ss: SymbolState, ev, armed: bool)
     offset = int(ITM_OFFSET_OVERRIDE) if ITM_OFFSET_OVERRIDE else PARAMS.itm_offset(spot)
     width = int(SPREAD_WIDTH_OVERRIDE) if SPREAD_WIDTH_OVERRIDE else PARAMS.spread_width(spot)
 
-    if direction == "long":
-        long_k = round(spot) - offset
-        short_k = long_k + width
-    else:
-        long_k = round(spot) + offset
-        short_k = long_k - width
+    long_k = round(spot) - offset if direction == "long" else round(spot) + offset
+    short_k = None if single else (long_k + width if direction == "long"
+                                   else long_k - width)
 
     long_id = await find_contract(bk, ss.symbol, expiry, long_k, kind)
-    short_id = await find_contract(bk, ss.symbol, expiry, short_k, kind)
-    if not (long_id and short_id):
-        log.warning("%s: could not resolve legs %s/%s", ss.symbol, long_k, short_k)
+    if not long_id:
+        log.warning("%s: could not resolve %s %s %s", ss.symbol, expiry, long_k, kind)
         return
+    legs = [{"option_id": long_id, "side": "buy", "position_effect": "open"}]
 
-    r = unwrap(await bk.call("get_option_quotes", {"instrument_ids": [long_id, short_id]}))
-    marks = {q["quote"]["instrument_id"]: float(q["quote"]["mark_price"])
-             for q in r["results"]}
-    debit = marks[long_id] - marks[short_id]
+    if not single:
+        short_id = await find_contract(bk, ss.symbol, expiry, short_k, kind)
+        if not short_id:
+            log.warning("%s: could not resolve short leg %s", ss.symbol, short_k)
+            return
+        legs.append({"option_id": short_id, "side": "sell",
+                     "position_effect": "open"})
+
+    marks = await quote_marks(bk, [l["option_id"] for l in legs])
+    debit = net_debit(marks, legs)
     if debit <= 0:
         log.warning("%s: nonsensical debit %.2f", ss.symbol, debit)
         return
 
     qty = size_position(ACCOUNT_VALUE, debit, STOP_PCT)
     if qty < 1:
-        log.warning("%s: risk budget too small for one contract at %.2f", ss.symbol, debit)
+        log.warning("%s: risk budget too small for one contract at %.2f — "
+                    "a %s costs $%.0f and 1%% of %s is $%.0f",
+                    ss.symbol, debit, PARAMS.structure, debit * 100,
+                    f"{ACCOUNT_VALUE:,.0f}", ACCOUNT_VALUE * PARAMS.risk_per_trade_pct)
         return
 
-    legs = [{"option_id": long_id, "side": "buy", "position_effect": "open"},
-            {"option_id": short_id, "side": "sell", "position_effect": "open"}]
+    label = (f"{long_k}{kind[0].upper()}" if single
+             else f"{long_k}/{short_k}{kind[0].upper()}")
 
     order_id = None
     if armed:
-        review = await bk.call("review_option_order", {
-            "account_number": ACCOUNT, "legs": legs, "quantity": str(qty),
-            "direction": "debit", "price": f"{debit:.2f}",
-            "chain_symbol": ss.symbol, "underlying_type": "equity",
-        })
+        order = {"account_number": ACCOUNT, "legs": legs, "quantity": str(qty),
+                 "direction": "debit", "price": f"{debit:.2f}"}
+        review = await bk.call("review_option_order",
+                               {**order, "chain_symbol": ss.symbol,
+                                "underlying_type": "equity"})
         journal("review", symbol=ss.symbol, payload=review)
-        placed = unwrap(await bk.call("place_option_order", {
-            "account_number": ACCOUNT, "legs": legs, "quantity": str(qty),
-            "direction": "debit", "price": f"{debit:.2f}",
-        }))
+        placed = unwrap(await bk.call("place_option_order", order))
         order_id = placed.get("id")
-        log.info("%s LIVE ORDER %s", ss.symbol, order_id)
+        log.info("%s LIVE ORDER %s (%s %s)", ss.symbol, order_id,
+                 PARAMS.structure, label)
     else:
-        log.info("%s PAPER FILL %dx %s/%s @ %.2f", ss.symbol, qty, long_k, short_k, debit)
+        log.info("%s PAPER FILL %dx %s %s @ %.2f",
+                 ss.symbol, qty, PARAMS.structure, label, debit)
 
     ss.position = {
         "symbol": ss.symbol, "direction": direction, "legs": legs,
+        "structure": PARAMS.structure, "kind": kind, "label": label,
         "expiry": expiry, "trade_dte": PARAMS.trade_dte,
         "long_strike": long_k, "short_strike": short_k,
         "entry_debit": debit, "quantity": qty, "order_id": order_id,
@@ -664,16 +707,16 @@ async def open_position(bk: Broker, st: State, ss: SymbolState, ev, armed: bool)
     st.put(ss)
     st.save()
     journal("entry", armed=armed, **ev.to_row(), debit=debit, quantity=qty,
+            structure=PARAMS.structure, kind=kind,
             long_strike=long_k, short_strike=short_k)
 
 
 async def manage_position(bk: Broker, st: State, ss: SymbolState, armed: bool):
     pos = ss.position
-    ids = [l["option_id"] for l in pos["legs"]]
-    r = unwrap(await bk.call("get_option_quotes", {"instrument_ids": ids}))
-    marks = {q["quote"]["instrument_id"]: float(q["quote"]["mark_price"])
-             for q in r["results"]}
-    value = marks[ids[0]] - marks[ids[1]]
+    legs = pos["legs"]
+    ids = [l["option_id"] for l in legs]
+    marks = await quote_marks(bk, ids)
+    value = net_debit(marks, legs)              # works for one leg or two
     pnl_pct = (value - pos["entry_debit"]) / pos["entry_debit"] * 100
     pnl_usd = (value - pos["entry_debit"]) * 100 * pos["quantity"]
     pos["current_value"] = round(value, 2)
@@ -705,10 +748,10 @@ async def manage_position(bk: Broker, st: State, ss: SymbolState, armed: bool):
         return
 
     if armed:
-        close_legs = [
-            {"option_id": ids[0], "side": "sell", "position_effect": "close"},
-            {"option_id": ids[1], "side": "buy", "position_effect": "close"},
-        ]
+        # Close by inverting every leg, whatever the structure was.
+        close_legs = [{"option_id": l["option_id"],
+                       "side": "sell" if l["side"] == "buy" else "buy",
+                       "position_effect": "close"} for l in legs]
         await bk.call("place_option_order", {
             "account_number": ACCOUNT, "legs": close_legs,
             "quantity": str(pos["quantity"]), "direction": "credit",
@@ -851,8 +894,24 @@ class Runner:
             log.error("dashboard did not start: %s", e)
             log.error("trading continues — the UI is optional, the bot is not")
 
-        log.info("watching %s | strategy v%s | %s",
-                 ",".join(SYMBOLS), VERSION, "LIVE" if self.armed else "PAPER")
+        log.info("watching %s | strategy v%s | %s %dDTE | %s",
+                 ",".join(SYMBOLS), VERSION, PARAMS.structure, PARAMS.trade_dte,
+                 "LIVE" if self.armed else "PAPER")
+
+        # Say up front what the risk budget can actually afford. Otherwise the
+        # first sign of trouble is a skipped entry at 08:35 on the one morning
+        # the checklist finally goes green.
+        budget = ACCOUNT_VALUE * PARAMS.risk_per_trade_pct
+        max_premium = budget / (100 * STOP_PCT)
+        log.info("risk %.0f%% of $%s = $%.0f per trade; at a %.0f%% stop the most "
+                 "one contract may cost is $%.2f",
+                 PARAMS.risk_per_trade_pct * 100, f"{ACCOUNT_VALUE:,.0f}", budget,
+                 STOP_PCT * 100, max_premium)
+        if PARAMS.structure == "single" and max_premium < 3.0:
+            log.warning("a single long option on SPY usually costs more than "
+                        "$%.2f — expect entries to be skipped. Raise "
+                        "GEXBOT_ACCOUNT_VALUE if it understates the account, "
+                        "trade QQQ instead, or use spreads.", max_premium)
 
         backoff = 5
         while not self.stop.is_set():
@@ -1005,38 +1064,51 @@ def report_accounts(payload: dict) -> None:
     The response key is `accounts`, not `results` — reading the wrong one made
     this print nothing at all, which looked like "no problems found".
 
-    This bot trades DEBIT SPREADS, which are multi-leg. Robinhood requires
-    options level 3 for spreads; level 2 covers long single-leg contracts and
-    covered calls only. An account that is agentic-enabled but level 2 will
-    take the connection happily and then reject every order.
+    Robinhood gates by structure: a debit spread is multi-leg and needs options
+    level 3, while a single long call or put only needs level 2. An account
+    that is agentic-enabled but level 2 will take the connection happily and
+    then reject every spread order, so check against what we actually trade.
     """
     rows = payload.get("accounts") or payload.get("results") or []
-    usable = []
-    print("\naccounts visible to this grant:")
+    need_level = 3 if PARAMS.structure == "spread" else 2
+    usable, agentic_rows = [], []
+    print(f"\naccounts visible to this grant "
+          f"(structure={PARAMS.structure}, needs options level {need_level}):")
+
     for acct in rows:
         if acct.get("deactivated") or acct.get("state") != "active":
             continue
         num = str(acct.get("account_number", "?"))
         agentic = bool(acct.get("agentic_allowed"))
-        level = acct.get("option_level") or "(none)"
-        spreads = level in ("option_level_3", "option_level_4")
-        flag = "OK" if (agentic and spreads) else "  "
-        print(f"  {flag}  ••••{num[-4:]}  agentic={agentic}  {level}"
+        level_s = acct.get("option_level") or ""
+        try:
+            level = int(level_s.rsplit("_", 1)[-1])
+        except (ValueError, AttributeError):
+            level = 0
+        ok = agentic and level >= need_level
+        print(f"  {'OK' if ok else '  '}  ••••{num[-4:]}  agentic={agentic}"
+              f"  {level_s or '(no options)'}"
               f"  {acct.get('brokerage_account_type','')}")
-        if agentic and spreads:
+        if agentic:
+            agentic_rows.append((num, level))
+        if ok:
             usable.append(num)
 
     if usable:
         print("\nSet GEXBOT_ACCOUNT to one of:", ", ".join(usable))
         return
 
-    print("\n! NO ACCOUNT CAN TRADE SPREADS THROUGH THIS AGENT.")
-    print("  This bot opens debit spreads, which need options level 3.")
-    print("  An account needs BOTH agentic access AND level 3.")
-    agentic_any = [a for a in rows if a.get("agentic_allowed")]
-    if agentic_any:
-        print("  Agentic access is on, but the level is too low. Request an")
-        print("  options upgrade for that account in the Robinhood app.")
+    print(f"\n! NO ACCOUNT CAN TRADE {PARAMS.structure.upper()}S THROUGH THIS AGENT.")
+    print(f"  An account needs BOTH agentic access AND options level {need_level}.")
+    if agentic_rows and PARAMS.structure == "spread":
+        best = max(level for _, level in agentic_rows)
+        print(f"  Agentic access is on, but the best level available is {best}.")
+        print("  Either request an options upgrade in the Robinhood app, or set")
+        print("  GEXBOT_STRUCTURE=single — long calls and puts need only level 2,")
+        print("  and the entry checklist is identical.")
+    elif agentic_rows:
+        print("  Agentic access is on but options are not enabled on it.")
+        print("  Request options access for that account in the Robinhood app.")
     else:
         print("  No account has agentic access. Enable it in Robinhood for the")
         print("  account you want the bot to trade.")

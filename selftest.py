@@ -712,6 +712,128 @@ def test_account_report(capsys_free=True) -> None:
           "masked for display, full for GEXBOT_ACCOUNT")
 
 
+def test_structures(tmp) -> None:
+    """
+    Single-leg and spread must both open, price, and close through one code
+    path. Singles matter practically: they need options level 2, spreads need
+    level 3.
+    """
+    print("\ntrade structures")
+    import importlib
+
+    for structure, legcount in (("spread", 2), ("single", 1)):
+        os.environ["GEXBOT_HOME"] = str(tmp)
+        os.environ["GEXBOT_STRUCTURE"] = structure
+        os.environ["GEXBOT_ACCOUNT_VALUE"] = "25000"
+        import gexbot
+        importlib.reload(gexbot)
+        check(f"{structure}: params carry structure",
+              gexbot.PARAMS.structure == structure)
+
+        placed = {}
+
+        class FakeBroker:
+            async def call(self, tool, args, retries=3):
+                if tool == "get_option_instruments":
+                    strike = args["strike_price"]
+                    return {"data": {"instruments": [{"id": f"id-{strike}"}]}}
+                if tool == "get_option_quotes":
+                    out = []
+                    for i, iid in enumerate(args["instrument_ids"]):
+                        # long leg richer than the short leg, so debit > 0
+                        out.append({"quote": {"instrument_id": iid,
+                                              "mark_price": f"{3.0 - 2.0 * i:.2f}"}})
+                    return {"data": {"results": out}}
+                if tool in ("review_option_order", "place_option_order"):
+                    placed.setdefault(tool, []).append(args)
+                    return {"data": {"id": "order-1"}}
+                raise AssertionError(tool)
+
+        st = gexbot.State()
+        ss = st.sym("SPY")
+        ss.trade_expiry = "2026-08-10"
+        ss.gamma_map = {"expiries": ["2026-08-10"]}
+
+        class Ev:
+            direction, spot = "long", 773.0
+            def to_row(self):
+                return {"symbol": "SPY", "grade": "A+"}
+
+        asyncio.run(gexbot.open_position(FakeBroker(), st, ss, Ev(), armed=False))
+        pos = st.sym("SPY").position
+        check(f"{structure}: position opened", pos is not None)
+        check(f"{structure}: {legcount} leg(s)", len(pos["legs"]) == legcount,
+              str([l["side"] for l in pos["legs"]]))
+        check(f"{structure}: long leg is a call on a long signal",
+              pos["kind"] == "call" and pos["legs"][0]["side"] == "buy")
+
+        if structure == "single":
+            check("single: no short leg", pos["short_strike"] is None)
+            check("single: debit is the full premium", pos["entry_debit"] == 3.0,
+                  f"{pos['entry_debit']} — no short leg financing it")
+            check("single: strike is ITM for a long",
+                  pos["long_strike"] < 773.0, str(pos["long_strike"]))
+        else:
+            check("spread: debit is the net of both legs",
+                  pos["entry_debit"] == 2.0,
+                  f"{pos['entry_debit']} = 3.00 long - 1.00 short")
+            check("spread: second leg is sold",
+                  pos["legs"][1]["side"] == "sell")
+
+        check(f"{structure}: stop is -45% of premium",
+              abs(pos["stop"] - pos["entry_debit"] * 0.55) < 0.01, str(pos["stop"]))
+        check(f"{structure}: target is +90% of premium",
+              abs(pos["target"] - pos["entry_debit"] * 1.9) < 0.01, str(pos["target"]))
+
+        # risk actually respects the 1% budget
+        risk = pos["quantity"] * pos["entry_debit"] * 100 * 0.45
+        check(f"{structure}: risk within budget", risk <= 250 + 1e-6,
+              f"{pos['quantity']}x risks ${risk:.0f} of $250")
+
+        # net_debit must agree with what was stored
+        marks = {l["option_id"]: m for l, m in
+                 zip(pos["legs"], [3.0, 1.0][:legcount])}
+        check(f"{structure}: net_debit reproduces entry",
+              gexbot.net_debit(marks, pos["legs"]) == pos["entry_debit"])
+
+        # closing inverts every leg
+        closed = [{"option_id": l["option_id"],
+                   "side": "sell" if l["side"] == "buy" else "buy"}
+                  for l in pos["legs"]]
+        check(f"{structure}: close inverts every leg",
+              all(c["side"] != l["side"] for c, l in zip(closed, pos["legs"])))
+
+    os.environ.pop("GEXBOT_STRUCTURE", None)
+
+
+def test_account_eligibility_by_structure(tmp) -> None:
+    """Level 3 gates spreads; level 2 is enough for singles."""
+    print("\naccount eligibility by structure")
+    import io
+    import contextlib
+    import importlib
+
+    for structure, expect_usable in (("spread", False), ("single", True)):
+        os.environ["GEXBOT_HOME"] = str(tmp)
+        os.environ["GEXBOT_STRUCTURE"] = structure
+        import gexbot
+        importlib.reload(gexbot)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            gexbot.report_accounts(LIVE_ACCOUNTS)
+        out = buf.getvalue()
+        usable = "Set GEXBOT_ACCOUNT to one of" in out
+        check(f"{structure}: level-2 agentic account usable={expect_usable}",
+              usable == expect_usable,
+              "agentic account is level 2; spreads need 3, singles need 2")
+        if structure == "spread":
+            check("spread failure suggests GEXBOT_STRUCTURE=single",
+                  "GEXBOT_STRUCTURE=single" in out,
+                  "points at the fix that needs no upgrade")
+
+    os.environ.pop("GEXBOT_STRUCTURE", None)
+
+
 def test_exception_helpers() -> None:
     print("\nerror handling")
     import gexbot
@@ -766,6 +888,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         test_broker_parsing(Path(d))
     test_account_report()
+    with tempfile.TemporaryDirectory() as d:
+        test_structures(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_account_eligibility_by_structure(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_session_roll(Path(d))
     with tempfile.TemporaryDirectory() as d:

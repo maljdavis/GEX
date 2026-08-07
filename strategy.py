@@ -32,6 +32,7 @@ VERSION = "2.0.0"
 Direction = Literal["long", "short"]
 Regime = Literal["positive", "negative"]
 Setup = Literal["breakout", "reversion"]
+Structure = Literal["spread", "single"]
 
 
 # ─────────────────────────── frozen parameters ───────────────────────────
@@ -52,6 +53,17 @@ class Params:
     trade_dte: int = 0                    # 0 = same day, 7 = a week out
     map_dte_max: int = 7                  # aggregate every expiry through this DTE
     hold_overnight: bool = False          # only meaningful when trade_dte > 0
+
+    # ── what you actually buy ─────────────────────────────────────────
+    # "spread" — debit vertical. Cheaper, theta-hedged (both legs decay
+    #            together), capped upside. Multi-leg: needs options level 3.
+    # "single" — one long call or put, direction from the EMA stack. Costs
+    #            more premium per contract and carries full theta, but the
+    #            upside isn't capped and it only needs options level 2.
+    #
+    # The tested evidence in HANDOFF.md is all spreads. Singles are the same
+    # entry logic with a different instrument — the checklist does not change.
+    structure: Structure = "spread"
 
     # 01 — EMA stack
     ema_fast: int = 9
@@ -89,6 +101,7 @@ class Params:
         assert 0 < self.risk_per_trade_pct <= 0.02
         assert 0 <= self.trade_dte <= 45
         assert self.map_dte_max >= 0
+        assert self.structure in ("spread", "single")
 
     def must_flatten_today(self) -> bool:
         """0DTE must be closed before expiry. Longer-dated need not be."""
@@ -103,6 +116,13 @@ class Params:
         contract won only 35%, since breakeven sat above the median winning
         move. With more time to expiry, extrinsic value does that work instead,
         so the offset can shrink toward ATM and cost less premium.
+
+        Singles use the SAME offset as spreads. Pushing them deeper would buy
+        more intrinsic — defensible in principle, since no short leg is
+        financing the premium — but it also raises the per-contract cost, and
+        on a small account that silently prices the bot out of trading at all.
+        Nothing in the tested sample says how much deeper is right, so it stays
+        at parity rather than inventing a multiplier.
         """
         base = max(2, round(spot * 0.005))          # ~0.5% of spot
         if self.trade_dte == 0:

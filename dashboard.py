@@ -170,7 +170,7 @@ async function tick(){
   const p = s.position;
   $('pos').innerHTML = p ? `
     <div class="stats">
-      <div class="stat"><b>${p.direction||'—'}</b><span>side</span></div>
+      <div class="stat"><b>${p.label||p.direction||'—'}</b><span>${p.structure||'position'}</span></div>
       <div class="stat"><b>${p.quantity}</b><span>qty</span></div>
       <div class="stat"><b>${p.entry_debit.toFixed(2)}</b><span>entry</span></div>
       <div class="stat"><b style="color:var(${p.pnl_pct>=0?'--pos':'--neg'})">${fmt(p.pnl_pct)}%</b><span>p&l</span></div>

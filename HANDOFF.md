@@ -62,6 +62,31 @@ No time-based exit. Hold to target, stop, or close.
 
 Soft failures cap the grade at B. All hard checks green → A+ → trade.
 
+## Structure: spread or single
+
+`GEXBOT_STRUCTURE` chooses the instrument; the checklist is untouched by it.
+
+- `spread` — debit vertical. Needs options **level 3**. Everything in Evidence
+  below was measured on spreads.
+- `single` — one long call or put. Needs options **level 2**, which is the
+  practical reason it exists: an agentic-enabled account at level 2 can trade
+  these and cannot trade spreads.
+
+**Singles are untested.** The DTE and exit findings below came from spread
+simulations, and two of them do not transfer cleanly: the spread debit is
+insensitive to DTE because both legs gain extrinsic together, while a single
+long pays for that time directly, and the −45% stop is reached far sooner on
+a single because there is no short leg damping the move. Expect a single to
+stop out more often than the spread numbers imply. Treat any single-leg run as
+a fresh dataset, not a continuation.
+
+The ITM offset is deliberately the same for both. Pushing singles deeper buys
+more intrinsic — arguable on the merits — but raises per-contract cost, and on
+a small account that silently prices the bot out of trading at all. Nothing
+measured says how much deeper is right, so it stays at parity.
+
+---
+
 Frozen params: entry 08:35–09:30 · fan ≥5 bp · volume ≥1.5× time-of-day
 baseline and rising · zone tolerance 0.15% · R:R 2.0 on premium (stop −45%,
 target +90%) · risk 1% · 1 trade per symbol per day. Bump `VERSION` on any
