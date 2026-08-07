@@ -366,6 +366,149 @@ def test_dashboard(ev: S.Evaluation, zones: dict) -> None:
     asyncio.run(run())
 
 
+def test_dashboard_render(ev: S.Evaluation, zones: dict) -> None:
+    """
+    Actually render the page against a realistic payload.
+
+    The float-key bug — Python emitting "770.0" where the JS looked up
+    prof[770] — threw inside the render and silently blanked every panel below
+    the gamma map. Serving 200 and returning valid JSON both still passed. Only
+    executing the page catches that class of bug.
+
+    Skipped, not failed, when Playwright is unavailable: this must not block an
+    install on a VPS with no browser.
+    """
+    print("\ndashboard render")
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  --    playwright not installed, skipping browser render")
+        return
+
+    # Find a browser without downloading one. A VPS install has neither
+    # Playwright nor a browser, and this check must never block a deploy.
+    import glob
+    launch_kw = {}
+    if not glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium*")):
+        found = (glob.glob("/opt/pw-browsers/chromium-*/chrome-linux/chrome")
+                 + glob.glob("/opt/pw-browsers/chromium/chrome-linux/chrome"))
+        if not found:
+            print("  --    no chromium available, skipping browser render")
+            return
+        launch_kw["executable_path"] = found[0]
+
+    import dashboard
+
+    payload = {
+        "now": "08:41:00", "armed": False, "heartbeat_age_s": 3,
+        "broker_error": "", "auth": {"logged_in": True, "detail": "ok"},
+        "phase": "SCANNING for A+ — window closes 09:30",
+        "symbol": "QQQ", "symbols": ["SPY", "QQQ"], "spot": 722.84,
+        "bias": "long", "trade_expiry": "2026-08-10",
+        # float-shaped keys, exactly as build_gamma_map emits them
+        "gamma_map": {"expiries": ["2026-08-10", "2026-08-11"],
+                      "net_gex_musd": 1141.0, "regime": "positive",
+                      "profile": {"720.0": -12.5, "721.0": 30.0, "722.0": 900.0,
+                                  "723.0": -44.25},
+                      "zones": zones, "flip": 708.5},
+        "evaluation": {"grade": ev.grade, "score": ev.score, "at": "08:41",
+                       "verdict": ev.verdict,
+                       "checks": [{"section": c.section, "name": c.name,
+                                   "passed": c.passed, "detail": c.detail,
+                                   "optional": c.optional} for c in ev.checks]},
+        "position": {"direction": "long", "quantity": 2, "entry_debit": 3.70,
+                     "current_value": 4.10, "pnl_pct": 10.8, "target": 7.03,
+                     "stop": 2.04, "long_strike": 720, "short_strike": None,
+                     "kind": "call", "structure": "single", "label": "720C",
+                     "expiry": "2026-08-10", "opened_at": "2026-08-10T08:41:00"},
+        "trades_today": 1, "max_trades": 1, "halted": False, "halt_reason": "",
+        "realized_today": 0.0, "best_grade": "A+",
+        "scans_today": 37,
+        "grade_counts": {"A+": 1, "C": 12, "F": 24},
+        "binding_counts": {"price_at_pivot": 20, "volume_confirms": 11,
+                           "daily_bias_clear": 5},
+        "recent_evals": [{"at": "08:41", "grade": "A+", "spot": 722.84,
+                          "score": "13/13", "blocked_by": None, "blockers": [],
+                          "zone": "dominant", "direction": "long",
+                          "fan_bp": 12.0, "volume_ratio": 2.4},
+                         {"at": "08:40", "grade": "C", "spot": 722.10,
+                          "score": "12/13", "blocked_by": "price_at_pivot",
+                          "blockers": ["price_at_pivot"], "zone": None,
+                          "direction": "long", "fan_bp": 9.0,
+                          "volume_ratio": 1.8}],
+        "config": {"structure": "single", "moneyness": "otm", "trade_dte": 1,
+                   "alloc_pct": 80, "account_value": 1000.0,
+                   "max_deployed": 800.0, "loss_at_stop": 360.0,
+                   "loss_at_stop_pct": 36.0, "entry_window": "08:35–09:30",
+                   "daily_stop": 200.0},
+        "log": [{"t": "08:41:00", "msg": "ENTRY long 2x @ 3.70"}],
+    }
+
+    # The server needs a RUNNING loop to answer requests, so it lives in a
+    # background thread while Playwright drives the page from this one.
+    import threading
+
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def serve_forever():
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(dashboard.serve(lambda: payload, port=8793,
+                                                host="127.0.0.1"))
+        ready.set()
+        loop.run_forever()
+
+    thread = threading.Thread(target=serve_forever, daemon=True)
+    thread.start()
+    if not ready.wait(10):
+        check("dashboard server started", False, "timed out")
+        return
+    try:
+        with sync_playwright() as pw:
+            try:
+                browser = pw.chromium.launch(**launch_kw)
+            except Exception as e:
+                print(f"  --    chromium would not launch ({str(e)[:60]}), skipping")
+                return
+            page = browser.new_page()
+            errors = []
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.goto("http://127.0.0.1:8793/", wait_until="load")
+            page.wait_for_timeout(600)
+
+            check("page renders with no JS errors", not errors, "; ".join(errors))
+
+            # every panel below the gamma map must have content — that is
+            # precisely what the thrown exception used to wipe out
+            for pid, label in (("profile", "gamma profile"),
+                               ("checks", "checklist"),
+                               ("pos", "position"),
+                               ("blockers", "why not trading"),
+                               ("evals", "bars evaluated"),
+                               ("log", "session log"),
+                               ("phase", "phase banner")):
+                html = page.inner_html(f"#{pid}")
+                check(f"{label} panel rendered", len(html.strip()) > 0)
+
+            body = page.inner_text("body")
+            # inner_text returns RENDERED text, and panel titles are
+            # text-transform:uppercase — compare case-insensitively.
+            low = body.lower()
+            check("gamma strikes shown", "722" in body)
+            check("no undefined leaked into the page", "undefined" not in body,
+                  "a float-key miss shows up here first")
+            check("no NaN leaked into the page", "NaN" not in body)
+            check("position is visibly monitored", "720c" in low)
+            check("live P&L shown", "+11%" in body or "10.8" in body or "+$" in body)
+            check("blocking checks shown", "price_at_pivot" in low)
+            check("scan count shown", "37 bars" in low)
+            check("phase stated in words", "scanning" in low)
+            check("risk stated in dollars", "360" in body)
+            browser.close()
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
 def test_journal_tail(tmp) -> None:
     print("\njournal")
     import dashboard
@@ -919,6 +1062,7 @@ def main() -> int:
     test_sizing()
     test_daily_bias()
     test_dashboard(ev, zones)
+    test_dashboard_render(ev, zones)
     with tempfile.TemporaryDirectory() as d:
         test_journal_tail(Path(d))
     with tempfile.TemporaryDirectory() as d:

@@ -2,3 +2,8 @@ mcp[cli]>=1.2.0
 pandas>=2.1
 numpy>=1.26
 aiohttp>=3.9
+
+# Optional, for selftest's browser render check only. The daemon never uses it
+# and selftest skips cleanly when it or a browser is absent:
+#   pip install playwright && playwright install chromium
+# playwright>=1.40

@@ -213,6 +213,15 @@ class SymbolState:
     position: dict | None = None
     trades_today: int = 0
 
+    # Session telemetry — what the bot looked at and why it passed.
+    # A checklist that says "sit out" is the normal outcome, so the useful
+    # question is never "did it trade" but "what kept stopping it".
+    scans_today: int = 0
+    grade_counts: dict = field(default_factory=dict)
+    binding_counts: dict = field(default_factory=dict)
+    recent_evals: list = field(default_factory=list)
+    best_grade: str = ""
+
 
 @dataclass
 class State:
@@ -845,18 +854,55 @@ class Runner:
                            "trades_today": 0, "max_trades": PARAMS.max_trades_per_day,
                            "halted": False, "halt_reason": ""}
         ss = st.sym(self.active)
+        sz = sizing_summary(ACCOUNT_VALUE, STOP_PCT, PARAMS)
         return base | {
             "symbol": ss.symbol, "symbols": SYMBOLS,
             "spot": ss.last_spot or None,
             "gamma_map": ss.gamma_map or {},
             "trade_expiry": ss.trade_expiry,
+            "bias": ss.bias,
             "evaluation": ss.last_evaluation,
             "position": ss.position,
             "trades_today": ss.trades_today,
             "max_trades": PARAMS.max_trades_per_day,
             "halted": st.halted, "halt_reason": st.halt_reason,
             "realized_today": round(st.realized_today, 2),
+            "phase": self.phase(st, ss),
+            "scans_today": ss.scans_today,
+            "grade_counts": ss.grade_counts,
+            "binding_counts": ss.binding_counts,
+            "recent_evals": ss.recent_evals,
+            "best_grade": ss.best_grade,
+            "config": {
+                "structure": PARAMS.structure, "moneyness": PARAMS.moneyness,
+                "trade_dte": PARAMS.trade_dte,
+                "alloc_pct": round(PARAMS.alloc_pct * 100),
+                "account_value": ACCOUNT_VALUE,
+                "max_deployed": sz["max_deployed"],
+                "loss_at_stop": sz["loss_at_stop"],
+                "loss_at_stop_pct": sz["loss_at_stop_pct"],
+                "entry_window": f"{PARAMS.entry_start:%H:%M}–{PARAMS.entry_end:%H:%M}",
+                "daily_stop": DAILY_LOSS_LIMIT,
+            },
         }
+
+    def phase(self, st: State, ss: SymbolState) -> str:
+        """One line answering 'what is it doing right now'."""
+        if st.halted:
+            return f"halted — {st.halt_reason}"
+        if ss.position:
+            return "MONITORING an open position"
+        if self.broker_error:
+            return "broker unreachable — retrying"
+        t = now().time()
+        if ss.trades_today >= PARAMS.max_trades_per_day:
+            return f"done for today — {ss.trades_today}/{PARAMS.max_trades_per_day} taken"
+        if t < PARAMS.entry_start:
+            return (f"pre-open — {'map built' if ss.gamma_map else 'building map'}, "
+                    f"scanning starts {PARAMS.entry_start:%H:%M}")
+        if t < PARAMS.entry_end:
+            return f"SCANNING for A+ — window closes {PARAMS.entry_end:%H:%M}"
+        return "entry window closed — flat until tomorrow"
 
     async def prepare(self, bk: Broker, st: State, symbol: str) -> None:
         """Once per session: resolve expiries, build the aggregate map, daily bias."""
@@ -901,9 +947,31 @@ class Runner:
         ev = evaluate(latest, symbol, ss.zones, ss.net_gex, ss.bias, ACCOUNT_VALUE)
         ss.last_evaluation = {
             "grade": ev.grade, "score": ev.score, "verdict": ev.verdict,
+            "at": ev.timestamp.strftime("%H:%M"),
+            "spot": round(ev.spot, 2), "zone": ev.zone, "direction": ev.direction,
             "checks": [{"section": c.section, "name": c.name, "passed": c.passed,
                         "detail": c.detail, "optional": c.optional} for c in ev.checks],
         }
+
+        ss.scans_today += 1
+        ss.grade_counts[ev.grade] = ss.grade_counts.get(ev.grade, 0) + 1
+        for c in ev.hard_failures:
+            ss.binding_counts[c.name] = ss.binding_counts.get(c.name, 0) + 1
+        order = {"A+": 4, "B": 3, "C": 2, "F": 1}
+        if order.get(ev.grade, 0) > order.get(ss.best_grade, 0):
+            ss.best_grade = ev.grade
+        # Keep the near-misses: a bar that failed one check is the interesting
+        # one, and it is what tells you whether the checklist is close or
+        # nowhere near.
+        ss.recent_evals.insert(0, {
+            "at": ev.timestamp.strftime("%H:%M"), "grade": ev.grade,
+            "spot": round(ev.spot, 2), "score": ev.score,
+            "blocked_by": ev.first_failure,
+            "blockers": [c.name for c in ev.hard_failures][:3],
+            "zone": ev.zone, "direction": ev.direction,
+            "fan_bp": ev.fan_bp, "volume_ratio": ev.volume_ratio,
+        })
+        del ss.recent_evals[25:]
         st.put(ss)
         journal("scan", **ev.to_row())
 
