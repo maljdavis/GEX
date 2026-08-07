@@ -145,6 +145,7 @@ async function tick(){
   $('status').innerHTML =
     `<span class="dot ${age<120?'ok':'stale'}"></span>`+
     `<span style="color:var(--muted)">${s.now} CT · beat ${age}s</span> `+
+    (s.auth&&!s.auth.logged_in?`<span class="badge live" title="${s.auth.detail}">not authorized</span> `:'')+
     (s.broker_error?`<span class="badge live" title="${s.broker_error}">broker down</span> `:'')+
     `<span class="badge ${s.armed?'live':'paper'}">${s.armed?'live':'paper'}</span>`;
 

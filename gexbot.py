@@ -43,6 +43,8 @@ try:                                            # mcp >= 2.0
 except ImportError:                             # mcp 1.x
     from mcp.client.streamable_http import streamablehttp_client as _http_client
 
+import auth as _auth
+
 from strategy import (PARAMS as _DEFAULT_PARAMS, VERSION, add_indicators,
                       build_zones, daily_bias, evaluate, pick_expiries,
                       regime_of, size_position)
@@ -189,6 +191,23 @@ class State:
 # ─────────────────────────── MCP ───────────────────────────
 
 
+def open_transport(url: str, provider):
+    """
+    Open the MCP transport with OAuth attached.
+
+    The two SDK generations take the credential differently: 2.x wants a
+    prepared httpx client, 1.x takes an `auth=` argument directly. Detect
+    rather than pin, same as the import above.
+    """
+    import inspect
+
+    params = inspect.signature(_http_client).parameters
+    if "http_client" in params:                 # mcp >= 2.0
+        from mcp.client.streamable_http import create_mcp_http_client
+        return _http_client(url, http_client=create_mcp_http_client(auth=provider))
+    return _http_client(url, auth=provider)     # mcp 1.x
+
+
 class Disconnected(RuntimeError):
     """The transport is gone. Only the supervisor may reconnect."""
 
@@ -261,6 +280,17 @@ def explain(e: BaseException) -> str:
 
     walk(e)
     return " | ".join(seen) if seen else f"{type(e).__name__}: {e}"
+
+
+def contains(e: BaseException, cls: type) -> bool:
+    """Is `cls` anywhere in this exception, including inside an ExceptionGroup?"""
+    if isinstance(e, cls):
+        return True
+    for sub in (getattr(e, "exceptions", None) or []):
+        if contains(sub, cls):
+            return True
+    cause = e.__cause__ or e.__context__
+    return bool(cause) and contains(cause, cls)
 
 
 def _result_text(res) -> str | None:
@@ -597,6 +627,7 @@ class Runner:
         st = self.state
         base = {"now": now().strftime("%H:%M:%S"), "armed": self.armed,
                 "broker_error": self.broker_error,
+                "auth": _auth.storage_for(MCP_URL, STATE_DIR).status(),
                 "log": tail_journal(JOURNAL, 40)}
         try:
             beat = datetime.fromisoformat(HEARTBEAT.read_text().strip())
@@ -707,6 +738,19 @@ class Runner:
                 await self.serve_connection(st)
                 backoff = 5
             except Exception as e:
+                if contains(e, _auth.NeedsLogin):
+                    # A human has to authorize. Retrying every few seconds
+                    # accomplishes nothing except filling the journal, so say
+                    # so plainly and check back slowly in case someone has
+                    # since run --login.
+                    self.broker_error = "not authorized — run: gexbot.py --login"
+                    log.error("NOT AUTHORIZED. Run this on the host, once:")
+                    log.error("    %s %s --login", sys.executable, __file__)
+                    log.error("retrying in 5 min in case you authorize now")
+                    journal("needs_login")
+                    HEARTBEAT.write_text(now().isoformat())
+                    await self.sleep(300)
+                    continue
                 self.broker_error = explain(e)[:200]
                 log.error("broker connection lost: %s", self.broker_error)
                 journal("broker_down", detail=explain(e))
@@ -725,7 +769,8 @@ class Runner:
         the supervisor reconnects.
         """
         bk = Broker(MCP_URL)
-        async with _http_client(MCP_URL) as streams:
+        provider = _auth.build_provider(MCP_URL, STATE_DIR, interactive=False)
+        async with open_transport(MCP_URL, provider) as streams:
             read, write = streams[0], streams[1]   # 1.x yields a third element
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -800,7 +845,66 @@ class Runner:
             pass
 
 
+# ─────────────────────────── authorization ───────────────────────────
+
+
+async def do_login() -> int:
+    """
+    One-time browser authorization. Drives the OAuth flow by making a real
+    connection: the SDK only starts the handshake when a request needs a token.
+    """
+    cb = _auth.CallbackServer()
+    await cb.start()
+    provider = _auth.build_provider(MCP_URL, STATE_DIR, interactive=True, callback=cb)
+
+    print(f"authorizing gexbot against {MCP_URL}")
+    try:
+        async with open_transport(MCP_URL, provider) as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                bk = Broker(MCP_URL)
+                bk.session = session
+                accounts = await bk.call("get_accounts", {})
+    except Exception as e:
+        print(f"\nauthorization failed: {explain(e)}", file=sys.stderr)
+        return 1
+    finally:
+        await cb.close()
+
+    print("\nauthorized. credentials stored under", STATE_DIR / "oauth")
+
+    # Surface the two things that silently block live trading later.
+    for acct in (unwrap(accounts).get("results") or []):
+        num = acct.get("account_number", "?")
+        agentic = acct.get("agentic_allowed")
+        level = acct.get("option_level") or acct.get("max_option_level")
+        print(f"  account {num}  agentic_allowed={agentic}  option_level={level}")
+        if agentic is False:
+            print("    ! agentic access is OFF for this account — enable it in "
+                  "Robinhood before arming")
+    print("\nSet GEXBOT_ACCOUNT to the account number you want to trade.")
+    return 0
+
+
+def do_auth_status() -> int:
+    st = _auth.storage_for(MCP_URL, STATE_DIR)
+    s = st.status()
+    print(f"endpoint     {MCP_URL}")
+    print(f"credentials  {st.tokens_file}")
+    for k, v in s.items():
+        print(f"{k:<12} {v}")
+    return 0 if s.get("logged_in") else 1
+
+
 def main() -> None:
+    if "--login" in sys.argv:
+        sys.exit(asyncio.run(do_login()))
+    if "--auth-status" in sys.argv:
+        sys.exit(do_auth_status())
+    if "--logout" in sys.argv:
+        _auth.logout(MCP_URL, STATE_DIR)
+        sys.exit(0)
+
     armed = "--live" in sys.argv and os.environ.get("GEXBOT_ARMED") == "yes"
     if "--live" in sys.argv and not armed:
         sys.exit("Refusing to arm: --live requires GEXBOT_ARMED=yes in the environment.")

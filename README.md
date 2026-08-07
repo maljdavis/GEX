@@ -29,6 +29,7 @@ historical data.
 | `strategy.py` | The 13-check framework. **Single source of truth for every rule.** |
 | `gexbot.py` | The daemon. Fetches data, calls `evaluate()`, places and manages orders. |
 | `dashboard.py` | Live UI on :8787. Token auth; refuses a public bind without one. |
+| `auth.py` | OAuth against the broker. `--login` once; refreshes silently after. |
 | `watchdog.py` | Heartbeat monitor. Alerts if the bot goes quiet during market hours. |
 | `gexrecon.py` | Rebuilds historical gamma maps from EOD open interest. |
 | `selftest.py` | Offline end-to-end verification. No broker, no network. |
@@ -73,9 +74,13 @@ against synthetic data, with no broker connection. Run it after every change.
 
 A $6/mo box is plenty — this is not compute-bound. Ubuntu 22.04+ or Debian 12+.
 
+**Step 1 — install.** In the VPS terminal (Hostinger's browser terminal works;
+you're already root on the box):
+
 ```bash
-scp -r GEX/ root@your-vps:/tmp/gexbot-src
-ssh root@your-vps 'bash /tmp/gexbot-src/deploy/install.sh'
+apt update && apt install -y git
+git clone https://github.com/maljdavis/GEX.git /tmp/gexbot-src
+bash /tmp/gexbot-src/deploy/install.sh
 ```
 
 The installer creates the system user, venv, and `/opt/gexbot`; installs
@@ -84,15 +89,37 @@ and **refuses to enable the service if it fails**; then installs the systemd
 unit and a watchdog timer. Re-running it upgrades code in place and never
 touches `gexbot.env` or `data/`.
 
-Then, on the box:
+**Step 2 — authorize Robinhood, once.** The daemon holds its own OAuth grant;
+a Claude connector authorizes Claude, not an unattended process. The VPS has no
+browser, so forward the callback port from your laptop and run the login on the
+box — credentials are written there and never travel:
 
-1. **Authorize Robinhood.** Complete the MCP OAuth flow on a machine with a
-   browser and copy the cached credentials into `/opt/gexbot/data/`, then
-   `chown -R gexbot:gexbot /opt/gexbot/data`. A standalone daemon needs its own
-   grant — a Claude connection does not transfer.
-2. Verify `agentic_allowed: true` and options level 3 via `get_accounts`.
-3. Edit `/opt/gexbot/gexbot.env`. Leave `GEXBOT_ARMED` commented.
-4. `systemctl start gexbot && journalctl -u gexbot -f`
+```bash
+# from your LAPTOP
+ssh -L 8788:127.0.0.1:8788 root@YOUR_VPS_IP
+
+# then, in that same session, on the VPS
+sudo -u gexbot /opt/gexbot/venv/bin/python /opt/gexbot/gexbot.py --login
+```
+
+It prints an authorize URL. Open it in your laptop browser, approve, and the
+redirect comes back down the tunnel. On success it lists your accounts with
+`agentic_allowed` and option level — the two things that silently block live
+trading later.
+
+```bash
+gexbot.py --auth-status     # logged in? when does the token expire?
+gexbot.py --logout          # revoke locally and start over
+```
+
+**Step 3 — configure and start.**
+
+```bash
+nano /opt/gexbot/gexbot.env   # GEXBOT_ACCOUNT, GEXBOT_ACCOUNT_VALUE, symbols
+                              # leave GEXBOT_ARMED commented — paper mode
+systemctl start gexbot
+journalctl -u gexbot -f
+```
 
 It restarts on failure, survives reboots, and reconnects on its own if the
 broker drops — the supervisor rebuilds the transport with exponential backoff

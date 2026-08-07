@@ -34,7 +34,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
   python3-venv python3-pip tzdata ca-certificates >/dev/null
 
 echo "==> application files"
-for f in gexbot.py strategy.py dashboard.py watchdog.py gexrecon.py \
+for f in gexbot.py strategy.py dashboard.py auth.py watchdog.py gexrecon.py \
          selftest.py requirements.txt; do
   install -m 0644 "$SRC_DIR/$f" "$APP_DIR/$f"
 done
@@ -83,11 +83,20 @@ cat <<DONE
 
 Installed to $APP_DIR. It is NOT running yet, and it is NOT armed.
 
-  1. Authorize Robinhood. Complete the MCP OAuth flow on a machine with a
-     browser, then copy the cached credentials into $DATA_DIR
-     and: chown -R $APP_USER:$APP_USER $DATA_DIR
+  1. Authorize Robinhood — once. From your LAPTOP, forward the callback port:
 
-  2. Edit $APP_DIR/gexbot.env — set GEXBOT_ACCOUNT_VALUE and symbols.
+        ssh -L 8788:127.0.0.1:8788 root@this-host
+
+     then in that session:
+
+        sudo -u $APP_USER $APP_DIR/venv/bin/python $APP_DIR/gexbot.py --login
+
+     It prints a URL. Open it in your laptop browser and approve. Tokens are
+     written to $DATA_DIR/oauth and never leave this box.
+     Check any time with:  gexbot.py --auth-status
+
+  2. Edit $APP_DIR/gexbot.env — set GEXBOT_ACCOUNT (printed by --login),
+     GEXBOT_ACCOUNT_VALUE, and symbols.
      Leave GEXBOT_ARMED commented out. It starts in PAPER mode.
 
   3. systemctl start gexbot && journalctl -u gexbot -f

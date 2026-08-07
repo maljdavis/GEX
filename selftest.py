@@ -353,6 +353,108 @@ def test_journal_tail(tmp) -> None:
     check("missing file is empty", dashboard.tail_journal(tmp / "nope", 40) == [])
 
 
+def test_auth(tmp) -> None:
+    """
+    Credential storage and the daemon's refusal to prompt. Nothing here talks
+    to a network — it covers the parts that decide whether an unattended
+    process can start at all.
+    """
+    print("\nauth")
+    import stat
+    import time as _time
+
+    import auth
+    from mcp.shared.auth import OAuthToken
+
+    URL = "https://agent.robinhood.com/mcp/trading"
+    st = auth.storage_for(URL, tmp)
+
+    check("starts logged out", st.status()["logged_in"] is False,
+          st.status()["detail"])
+
+    async def roundtrip():
+        await st.set_tokens(OAuthToken(access_token="tok-abc", token_type="Bearer",
+                                       expires_in=3600, refresh_token="ref-xyz"))
+        got = await st.get_tokens()
+        check("tokens round-trip", got is not None and got.access_token == "tok-abc")
+        check("refresh token kept", got.refresh_token == "ref-xyz")
+    asyncio.run(roundtrip())
+
+    mode = stat.S_IMODE(st.tokens_file.stat().st_mode)
+    check("token file is 0600", mode == 0o600, oct(mode))
+    check("oauth dir is 0700", stat.S_IMODE(st.dir.stat().st_mode) == 0o700)
+
+    s = st.status()
+    check("reports logged in", s["logged_in"] is True)
+    check("reports refresh available", s["has_refresh"] is True)
+    check("expiry counted down", 0 < s["expires_in_s"] <= 3600, f"{s['expires_in_s']}s")
+
+    # an expired access token is survivable — the refresh token carries it
+    raw = json.loads(st.tokens_file.read_text())
+    raw["obtained_at"] = int(_time.time()) - 7200
+    st.tokens_file.write_text(json.dumps(raw))
+    s = st.status()
+    check("expired but refreshable is not fatal",
+          s["logged_in"] and "refresh" in s["detail"], s["detail"])
+
+    raw.pop("refresh_token")
+    st.tokens_file.write_text(json.dumps(raw))
+    check("expired with no refresh demands login",
+          "--login" in st.status()["detail"], st.status()["detail"])
+
+    # a corrupt file must read as "not logged in", never crash the daemon
+    st.tokens_file.write_text("{ truncated")
+    check("corrupt token file is survivable", st.status()["logged_in"] is False)
+    check("corrupt file reads as absent",
+          asyncio.run(st.get_tokens()) is None)
+
+    # different endpoint -> different credentials
+    other = auth.storage_for("https://example.invalid/mcp", tmp)
+    check("credentials keyed per endpoint",
+          other.tokens_file != st.tokens_file,
+          "a grant for one server is never reused for another")
+
+    # the daemon must refuse to block on a browser
+    prov = auth.build_provider(URL, tmp, interactive=False)
+    check("provider builds without a browser", prov is not None)
+
+    async def must_refuse():
+        # Deliberately not tolerant of AttributeError: if the SDK moves this
+        # handler, this assertion must fail loudly rather than quietly pass
+        # while the daemon regains the ability to hang on a browser prompt.
+        try:
+            await prov.context.redirect_handler("https://example.com/authorize")
+            return False
+        except auth.NeedsLogin:
+            return True
+    check("non-interactive refuses to prompt", asyncio.run(must_refuse()),
+          "systemd can't answer a browser prompt")
+
+    auth.logout(URL, tmp)
+    check("logout clears credentials", st.status()["logged_in"] is False)
+
+
+def test_exception_helpers() -> None:
+    print("\nerror handling")
+    import gexbot
+
+    inner = RuntimeError("403 Forbidden")
+    grouped = ExceptionGroup("unhandled errors in a TaskGroup", [inner])
+    check("explain() digs out the leaf", "403 Forbidden" in gexbot.explain(grouped),
+          gexbot.explain(grouped))
+    check("explain() drops the TaskGroup noise",
+          "TaskGroup" not in gexbot.explain(grouped))
+
+    import auth
+    nested = ExceptionGroup("outer", [ExceptionGroup("inner",
+                                                    [auth.NeedsLogin("x")])])
+    check("contains() finds nested NeedsLogin",
+          gexbot.contains(nested, auth.NeedsLogin),
+          "so the supervisor backs off instead of hammering")
+    check("contains() is not overeager",
+          not gexbot.contains(grouped, auth.NeedsLogin))
+
+
 def main() -> int:
     import tempfile
     from pathlib import Path
@@ -373,6 +475,9 @@ def main() -> int:
     test_dashboard(ev, zones)
     with tempfile.TemporaryDirectory() as d:
         test_journal_tail(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_auth(Path(d))
+    test_exception_helpers()
 
     print()
     if FAILURES:

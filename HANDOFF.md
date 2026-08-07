@@ -23,6 +23,7 @@ confirm **when**. Levels are the core; the rest is confirmation.
 | `strategy.py` | **Done.** 13-check framework. Single source of truth for every rule. |
 | `gexbot.py` | **Done.** Daemon. Imports `evaluate()` — zero duplicated rule logic. |
 | `dashboard.py` | **Done, wired.** Live UI on :8787, token auth, refuses public bind without one. |
+| `auth.py` | **Done, unverified against the live endpoint.** OAuth 2.1 via the SDK: `--login` once, silent refresh after. Tokens 0600 under `$GEXBOT_HOME/oauth`. |
 | `gexrecon.py` | **Done, blocked.** Rebuilds historical gamma maps from EOD open interest. Needs purchased chain data. |
 | `watchdog.py` | **Done.** Heartbeat monitor, systemd timer every 5 min. |
 | `selftest.py` | **Done.** Offline end-to-end check: indicators → zones → 13 checks → dashboard → auth. Run it after every change. |
@@ -220,12 +221,23 @@ alerted "no heartbeat" every five minutes forever.
 
 Then:
 
-1. Complete the Robinhood MCP OAuth flow on a machine with a browser; copy
-   cached credentials to `/opt/gexbot/data/`. A standalone script needs its own
-   grant — the Claude connection doesn't transfer.
-2. Verify `agentic_allowed: true` and options level 3 via `get_accounts`.
+1. Authorize once. The daemon holds its own grant — the Claude connection
+   doesn't transfer. The VPS has no browser, so forward the callback port:
+   `ssh -L 8788:127.0.0.1:8788 root@vps`, then run `gexbot.py --login` on the
+   box and open the printed URL locally. Tokens are written to
+   `$GEXBOT_HOME/oauth` at 0600 and never leave the host.
+2. `--login` prints each account's `agentic_allowed` and option level. Both
+   must be right before arming; it warns when agentic access is off.
 3. Edit `/opt/gexbot/gexbot.env`. Leave `GEXBOT_ARMED` commented.
 4. `systemctl start gexbot && journalctl -u gexbot -f`
+
+**The OAuth flow has never completed against the live endpoint** — it was built
+and unit-tested where `agent.robinhood.com` is unreachable. Discovery, dynamic
+client registration, and PKCE are the SDK's implementation, not hand-rolled, so
+the protocol should be right; what's unverified is Robinhood's specifics
+(whether it supports dynamic registration, what scopes it wants, whether it
+accepts a loopback redirect). If `--login` fails, that is the first place to
+look, and `GEXBOT_OAUTH_SCOPE` is the first knob.
 
 **Dashboard.** Binds `127.0.0.1` by default. For phone access install Tailscale
 on the VPS and set `GEXBOT_DASH_HOST=0.0.0.0` with a token. Do not open 8787 to
