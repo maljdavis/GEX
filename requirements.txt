@@ -1,0 +1,4 @@
+mcp[cli]>=1.2.0
+pandas>=2.1
+numpy>=1.26
+aiohttp>=3.9

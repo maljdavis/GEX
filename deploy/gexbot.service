@@ -1,0 +1,47 @@
+[Unit]
+Description=gexbot — gamma-level options trading daemon
+After=network-online.target
+Wants=network-online.target
+
+# Don't let a crash loop hammer the broker API.
+# These are [Unit] options — systemd ignores them under [Service].
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gexbot
+Group=gexbot
+WorkingDirectory=/opt/gexbot
+EnvironmentFile=/opt/gexbot/gexbot.env
+ExecStart=/opt/gexbot/venv/bin/python /opt/gexbot/gexbot.py
+Restart=always
+RestartSec=10
+
+# Unbuffered, or journalctl -f lags a full block behind the market.
+Environment=PYTHONUNBUFFERED=1
+
+# Give the loop time to finish its cycle and flush state
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gexbot
+
+# Hardening — this process holds broker credentials
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/gexbot/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

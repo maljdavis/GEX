@@ -1,0 +1,22 @@
+# virtualenv
+venv/
+.venv/
+
+# runtime state — credentials, journal, heartbeat, logs
+data/
+*.log
+state.json
+heartbeat
+journal.ndjson
+
+# the real env file holds the dashboard token and account number.
+# deploy/gexbot.env.example is the tracked template.
+gexbot.env
+
+# historical chain data (large, and licensed)
+chains/
+*.csv
+
+__pycache__/
+*.py[cod]
+.DS_Store

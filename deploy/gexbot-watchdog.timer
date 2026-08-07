@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the gexbot watchdog every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+# The watchdog itself checks whether the market is open, so it's cheap to run
+# around the clock — and running it off-hours is how you find out the box
+# rebooted overnight.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

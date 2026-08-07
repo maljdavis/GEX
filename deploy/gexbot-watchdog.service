@@ -1,0 +1,26 @@
+[Unit]
+Description=gexbot watchdog — alert if the heartbeat goes stale during market hours
+
+[Service]
+Type=oneshot
+User=gexbot
+Group=gexbot
+WorkingDirectory=/opt/gexbot
+
+# The whole point of a timer over a cron line: the watchdog gets the SAME
+# environment as the bot. Under cron it had no GEXBOT_HOME, so it looked in
+# ~gexbot/.gexbot while the bot wrote to /opt/gexbot/data — and alerted "no
+# heartbeat" every five minutes forever.
+EnvironmentFile=/opt/gexbot/gexbot.env
+ExecStart=/opt/gexbot/venv/bin/python /opt/gexbot/watchdog.py
+
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gexbot-watchdog
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/gexbot/data
