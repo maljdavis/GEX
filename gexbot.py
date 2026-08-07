@@ -70,6 +70,45 @@ def _params_from_env() -> Params:
     return _dc.replace(_DEFAULT_PARAMS, **over) if over else _DEFAULT_PARAMS
 
 
+def _load_env_file() -> None:
+    """
+    Fill os.environ from the deployment env file, for runs that aren't systemd.
+
+    systemd passes these through EnvironmentFile, but `gexbot.py --login` typed
+    by hand gets none of them. That split is not cosmetic: GEXBOT_HOME decides
+    where OAuth tokens are written, so an interactive --login would save
+    credentials to ~/.gexbot while the service looked in /opt/gexbot/data and
+    reported "not authorized" forever.
+
+    Real environment variables always win, so systemd's values are never
+    overridden — this only fills gaps.
+    """
+    candidates = [os.environ.get("GEXBOT_ENV_FILE"),
+                  "/opt/gexbot/gexbot.env",
+                  str(Path(__file__).resolve().parent / "gexbot.env")]
+    for cand in candidates:
+        if not cand:
+            continue
+        path = Path(cand)
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text()
+        except PermissionError:
+            continue                     # not ours to read; systemd will supply it
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+        return
+
+
+_load_env_file()
+
 PARAMS = _params_from_env()
 
 # ─────────────────────────── config ───────────────────────────

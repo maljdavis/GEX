@@ -513,6 +513,61 @@ def inspect_source(fn) -> str:
     return inspect.getsource(fn)
 
 
+def test_env_file(tmp) -> None:
+    """
+    Regression: `--login` typed by hand got none of systemd's EnvironmentFile,
+    so GEXBOT_HOME defaulted to ~/.gexbot and credentials were written where
+    the service would never look — "not authorized" forever despite a
+    successful browser flow.
+    """
+    print("\nenv file loading")
+    import importlib
+    import subprocess
+
+    envf = tmp / "gexbot.env"
+    envf.write_text("# a comment\n\n"
+                    f"GEXBOT_HOME={tmp}/data\n"
+                    'GEXBOT_SYMBOLS="SPY"\n'
+                    "GEXBOT_DASH_PORT=8899\n"
+                    "MALFORMED_LINE_NO_EQUALS\n")
+
+    def probe(extra_env: dict) -> dict:
+        code = ("import json,gexbot;"
+                "print(json.dumps({'home':str(gexbot.STATE_DIR),"
+                "'symbols':gexbot.SYMBOLS,'port':gexbot.DASH_PORT}))")
+        env = {**os.environ, "GEXBOT_ENV_FILE": str(envf)}
+        env.pop("GEXBOT_HOME", None)
+        env.pop("GEXBOT_SYMBOLS", None)
+        env.pop("GEXBOT_DASH_PORT", None)
+        env.update(extra_env)
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                             text=True, env=env, cwd=os.path.dirname(__file__) or ".")
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    got = probe({})
+    check("env file supplies GEXBOT_HOME", got["home"] == f"{tmp}/data", got["home"])
+    check("quotes stripped from values", got["symbols"] == ["SPY"], got["symbols"])
+    check("malformed lines ignored", got["port"] == 8899)
+
+    got = probe({"GEXBOT_HOME": f"{tmp}/override"})
+    check("real environment beats the file", got["home"] == f"{tmp}/override",
+          "systemd's EnvironmentFile must never be overridden")
+
+    # The actual bug: credentials must land under the env file's GEXBOT_HOME,
+    # not the invoking user's home directory. Resolve the path the same way a
+    # hand-run --login does, and assert it sits under the configured home.
+    from pathlib import Path as _P
+    import auth
+    URL = "https://agent.robinhood.com/mcp/trading"
+    configured = probe({})["home"]
+    creds = auth.storage_for(URL, _P(configured)).tokens_file
+    check("credentials land under the configured GEXBOT_HOME",
+          str(creds).startswith(configured), str(creds))
+    check("credentials are NOT in the invoking user's home",
+          not str(creds).startswith(str(_P.home() / ".gexbot")),
+          "a hand-run --login must not hide tokens from the service")
+
+
 def test_exception_helpers() -> None:
     print("\nerror handling")
     import gexbot
@@ -535,8 +590,14 @@ def test_exception_helpers() -> None:
 
 
 def main() -> int:
+    import logging
     import tempfile
     from pathlib import Path
+
+    # Several tests deliberately feed corrupt credential files to prove the
+    # daemon degrades instead of crashing. Their warnings are expected, and
+    # printing them mid-install reads like something went wrong.
+    logging.getLogger("gexbot.auth").setLevel(logging.CRITICAL)
 
     print(f"gexbot selftest — strategy v{S.VERSION}")
     bars = synth_bars()
@@ -556,6 +617,8 @@ def main() -> int:
         test_journal_tail(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_auth(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_env_file(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_session_roll(Path(d))
     with tempfile.TemporaryDirectory() as d:

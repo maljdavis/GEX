@@ -58,6 +58,26 @@ fi
 chmod 600 "$APP_DIR/gexbot.env"
 chown -R $APP_USER:$APP_USER "$APP_DIR"
 
+echo "==> credential migration"
+# Early builds ran --login without the env file, so GEXBOT_HOME was unset and
+# tokens landed in the service user's home while the daemon looked in
+# $DATA_DIR — an endless "not authorized" despite a successful browser flow.
+# gexbot.py now reads gexbot.env itself; move any stranded credentials so
+# nobody has to authorize twice.
+STRANDED=/home/$APP_USER/.gexbot/oauth
+if [[ -d $STRANDED ]] && compgen -G "$STRANDED/*.json" >/dev/null; then
+  mkdir -p "$DATA_DIR/oauth"
+  for f in "$STRANDED"/*.json; do
+    [[ -f $DATA_DIR/oauth/$(basename "$f") ]] || mv "$f" "$DATA_DIR/oauth/"
+  done
+  chown -R $APP_USER:$APP_USER "$DATA_DIR/oauth"
+  chmod 700 "$DATA_DIR/oauth"; chmod 600 "$DATA_DIR"/oauth/*.json 2>/dev/null || true
+  rmdir "$STRANDED" 2>/dev/null || true
+  echo "    moved existing credentials into $DATA_DIR/oauth"
+else
+  echo "    nothing to migrate"
+fi
+
 echo "==> verifying the install before enabling anything"
 # Runs offline against synthetic data. If the pipeline is broken, find out
 # now rather than at 08:35 with real money on the line.
@@ -83,7 +103,11 @@ cat <<DONE
 
 Installed to $APP_DIR. It is NOT running yet, and it is NOT armed.
 
-  1. Authorize Robinhood — once. From your LAPTOP, forward the callback port:
+  1. Authorize Robinhood — once, if --auth-status says you aren't:
+
+        sudo -u $APP_USER $APP_DIR/venv/bin/python $APP_DIR/gexbot.py --auth-status
+
+     From your LAPTOP, forward the callback port:
 
         ssh -L 8788:127.0.0.1:8788 root@this-host
 
