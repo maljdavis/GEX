@@ -1191,6 +1191,62 @@ def report_accounts(payload: dict) -> None:
     print("  Paper mode is unaffected — it never places an order.")
 
 
+async def do_levels() -> int:
+    """
+    Build today's gamma map and print it, then exit.
+
+    Exists to be checked against someone else's numbers. The dealer sign
+    convention — long calls, short puts — is assumed, not observed, and if it
+    is backwards every level is confidently inverted: the bot would treat
+    resistance as support and lose steadily without any single thing looking
+    broken. Comparing these levels against a published GEX chart for the same
+    symbol on the same morning is the cheapest test of that assumption there
+    is, and it costs nothing.
+
+    Run it during market hours; open interest is fixed for the session.
+    """
+    provider = _auth.build_provider(MCP_URL, STATE_DIR, interactive=False)
+    async with open_transport(MCP_URL, provider) as streams:
+        async with ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            bk = Broker(MCP_URL)
+            bk.session = session
+
+            for symbol in SYMBOLS:
+                spot = await get_spot(bk, symbol)
+                available = await list_expiries(bk, symbol)
+                trade_exp, map_exps = pick_expiries(available, now().date(), PARAMS)
+                gmap = await build_gamma_map(bk, symbol, map_exps, spot)
+                if not gmap:
+                    print(f"\n{symbol}: no gamma data")
+                    continue
+
+                print(f"\n{'=' * 58}\n{symbol}  spot {spot:.2f}   "
+                      f"{now():%Y-%m-%d %H:%M} CT")
+                print(f"net GEX {gmap['net_gex_musd']:+,.0f}M  "
+                      f"regime {gmap['regime']}")
+                print(f"expiries mapped: {', '.join(map_exps)}")
+                print(f"would trade: {trade_exp}\n")
+                for name in ("call_wall", "flip", "dominant", "put_wall"):
+                    z = gmap["zones"].get(name)
+                    if z:
+                        print(f"  {name:<10} {z['level']:>9.2f}   "
+                              f"zone {z['lo']:.2f}–{z['hi']:.2f}")
+
+                prof = {float(k): v for k, v in gmap["profile"].items()}
+                top = sorted(prof.items(), key=lambda kv: -abs(kv[1]))[:8]
+                print("\n  largest strikes by |GEX|:")
+                for strike, gex in sorted(top):
+                    bar = "+" if gex >= 0 else "-"
+                    print(f"    {strike:>8.0f}  {gex:>+9.1f}M  "
+                          f"{bar * min(int(abs(gex) / max(abs(top[0][1]), 1) * 30), 30)}")
+
+    print("\nCompare these against a published GEX chart for the same symbol,")
+    print("today. If the call and put walls are swapped relative to theirs, the")
+    print("dealer sign convention is inverted — see build_gamma_map().")
+    return 0
+
+
 def do_auth_status() -> int:
     st = _auth.storage_for(MCP_URL, STATE_DIR)
     s = st.status()
@@ -1206,6 +1262,8 @@ def main() -> None:
         sys.exit(asyncio.run(do_login()))
     if "--auth-status" in sys.argv:
         sys.exit(do_auth_status())
+    if "--levels" in sys.argv:
+        sys.exit(asyncio.run(do_levels()))
     if "--logout" in sys.argv:
         _auth.logout(MCP_URL, STATE_DIR)
         sys.exit(0)

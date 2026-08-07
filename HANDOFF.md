@@ -314,3 +314,47 @@ edge (if any) compounds across many trades. At 36% per trade the same
 distribution of outcomes produces a very different path: the arithmetic that
 matters is no longer the mean return but the chance of ruin before the sample
 gets large enough to mean anything. Nothing here measures that.
+
+---
+
+## Data providers — what is worth buying
+
+The bot computes GEX itself from the Robinhood chain, so a **live** GEX feed
+buys nothing. Two things are genuinely missing, and only one of them costs
+money.
+
+**1. Verifying the sign convention — free.** `build_gamma_map()` assumes
+dealers are long calls and short puts. That is not observable from public data,
+and if it is backwards every level inverts: the bot treats resistance as
+support and loses steadily with nothing looking broken. `gexbot.py --levels`
+prints today's call wall, put wall, flip and the largest strikes. Compare them
+against any published GEX chart for the same symbol on the same day
+(InsiderFinance, Menthor Q, SpotGamma, gammalab). Agreement is weak evidence
+the implementation is right; **inversion is strong evidence it is wrong**. Do
+this before trusting a single paper result. Note that agreement only shows you
+match their convention — if the whole retail consensus is wrong, you match it
+wrongly, which is what `gexrecon.py --invert-signs` is for.
+
+**2. Historical GEX for `backtest.py` — the real blocker.** Expired contracts
+return `open_interest: 0`, so history cannot be rebuilt from the broker. This
+is why `gexrecon.py` is stalled and why the gamma layer has never been tested.
+
+Providers that sell it, in rough order of fit:
+
+- **FlashAlpha** — point-in-time replay since 2018-04 at minute granularity,
+  per-contract greeks and OI, computed GEX/DEX/max-pain, REST plus SDKs.
+  Closest to a drop-in for `backtest.py`.
+- **BackQuant** — strike-level GEX, ranked walls, historical GEX series,
+  0DTE-specific profiles.
+- **ORATS / CBOE DataShop / OptionMetrics** — raw options history; you compute
+  gamma yourself, which `gexrecon.py` already does.
+- **HistoricalData.net** — EOD chains with OI. The free 2013 archive is the
+  right way to validate the `gexrecon.py` CSV loader before paying anyone.
+
+**Read this before subscribing.** FlashAlpha is both the best-fitting data
+source above and the author of the pre-registered 1,972-day SPY study cited in
+Caveats — the one finding GEX signal largely disappears after controlling for
+VIX and ATM IV. Buying their data to test a thesis their own research argues
+against is not a contradiction, but it does mean the honest version of this
+purchase is "buy the data that can falsify this," not "buy the data that will
+make it work."
