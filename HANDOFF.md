@@ -87,6 +87,20 @@ measured says how much deeper is right, so it stays at parity.
 
 ---
 
+### Entry window
+
+`GEXBOT_ENTRY_START` / `GEXBOT_ENTRY_END` (Central). The original 08:35–09:30
+is what produced the 27% trigger rate below; widening it is a change of
+strategy, not a setting, and the resulting mix is unmeasured — midday chop is
+not the opening drive.
+
+It is coherent with dated contracts. A 0DTE opened at 13:45 has 45 minutes
+before the 14:30 force-flat, and short holds lost money at every DTE on the
+tested sample. A contract held overnight has no force-flat, so a late entry has
+days to work — that is the configuration a wide window belongs with. The bot
+warns at startup when the window ends within an hour of a force-flat that
+actually applies.
+
 Frozen params: entry 08:35–09:30 · fan ≥5 bp · volume ≥1.5× time-of-day
 baseline and rising · zone tolerance 0.15% · R:R 2.0 on premium (stop −45%,
 target +90%) · risk 1% · 1 trade per symbol per day. Bump `VERSION` on any

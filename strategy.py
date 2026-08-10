@@ -43,6 +43,11 @@ Moneyness = Literal["itm", "atm", "otm"]
 class Params:
     # session clock, CENTRAL time
     entry_start: dtime = dtime(8, 35)     # first candle excluded — opening auction
+    # The original window was the first hour only. Widening it is a real
+    # change of strategy, not a setting: the measured 27% trigger rate in
+    # HANDOFF.md was produced by this window, and a longer one means more bars
+    # evaluated, more triggers, and a different (untested) mix of setups —
+    # midday chop is not the same tape as the opening drive.
     entry_end: dtime = dtime(9, 30)
     force_flat: dtime = dtime(14, 30)     # 0DTE only — see must_flatten_today()
 
@@ -136,6 +141,7 @@ class Params:
 
     def __post_init__(self):
         assert self.ema_fast < self.ema_mid < self.ema_slow
+        assert self.entry_start < self.entry_end, "entry window is empty"
         assert self.rr_min >= 2.0, "checklist floor is 1:2"
         assert 0 < self.alloc_pct <= 0.95, "allocation must be within (0, 95%]"
         assert self.risk_per_trade_pct is None or 0 < self.risk_per_trade_pct <= 1.0

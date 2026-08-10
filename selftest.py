@@ -1071,6 +1071,53 @@ def test_account_eligibility_by_structure(tmp) -> None:
     os.environ.pop("GEXBOT_STRUCTURE", None)
 
 
+def test_entry_window(tmp) -> None:
+    """The entry window is configurable, validated, and clock-parsed."""
+    print("\nentry window")
+    import importlib
+    from datetime import time as dtime
+
+    os.environ["GEXBOT_HOME"] = str(tmp)
+    for k in ("GEXBOT_ENTRY_START", "GEXBOT_ENTRY_END", "GEXBOT_MAX_TRADES"):
+        os.environ.pop(k, None)
+    os.environ["GEXBOT_ENTRY_START"] = "08:35"
+    os.environ["GEXBOT_ENTRY_END"] = "14:00"
+    os.environ["GEXBOT_MAX_TRADES"] = "3"
+    import gexbot
+    importlib.reload(gexbot)
+
+    check("entry start parsed", gexbot.PARAMS.entry_start == dtime(8, 35))
+    check("entry end parsed", gexbot.PARAMS.entry_end == dtime(14, 0),
+          str(gexbot.PARAMS.entry_end))
+    check("max trades parsed", gexbot.PARAMS.max_trades_per_day == 3)
+
+    # an all-day window must actually admit a midday bar
+    zones = S.build_zones(synth_profile(600.0), 600.0)
+    import pandas as _pd
+    bar = _pd.Series({"ts": _pd.Timestamp("2026-08-07 13:15"), "close": 600.0,
+                      "direction": "long", "fan_bp": 12.0, "volume_ratio": 2.4,
+                      "volume_expanding": True, "pattern": "flag",
+                      "confirm_long": True, "structural_level": 597.6,
+                      "swing_low": 597.6, "swing_high": 602.0})
+    ev = S.evaluate(bar, "SPY", zones, -400.0, "long", 1000.0, gexbot.PARAMS)
+    timing = [c for c in ev.checks if c.name == "entry_window"][0]
+    check("13:15 accepted in a wide window", timing.passed, timing.detail)
+
+    narrow = S.Params(entry_start=dtime(8, 35), entry_end=dtime(9, 30))
+    ev2 = S.evaluate(bar, "SPY", zones, -400.0, "long", 1000.0, narrow)
+    timing2 = [c for c in ev2.checks if c.name == "entry_window"][0]
+    check("13:15 rejected in the original window", not timing2.passed)
+
+    try:
+        S.Params(entry_start=dtime(14, 0), entry_end=dtime(9, 0))
+        check("empty window rejected", False, "accepted a backwards window")
+    except AssertionError:
+        check("empty window rejected", True, "entry_start must precede entry_end")
+
+    for k in ("GEXBOT_ENTRY_START", "GEXBOT_ENTRY_END", "GEXBOT_MAX_TRADES"):
+        os.environ.pop(k, None)
+
+
 def test_exception_helpers() -> None:
     print("\nerror handling")
     import gexbot
@@ -1118,6 +1165,9 @@ def main() -> int:
     test_dashboard(ev, zones)
     test_dashboard_render(ev, zones)
     test_bind_policy()
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _d:
+        test_entry_window(Path(_d))
     with tempfile.TemporaryDirectory() as d:
         test_journal_tail(Path(d))
     with tempfile.TemporaryDirectory() as d:

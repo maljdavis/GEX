@@ -84,7 +84,24 @@ def _params_from_env() -> Params:
         over["risk_per_trade_pct"] = _fraction(v, "GEXBOT_RISK_PCT")
     if v := os.environ.get("GEXBOT_MAX_CONTRACTS"):
         over["max_contracts"] = int(v)
+    if v := os.environ.get("GEXBOT_MAX_TRADES"):
+        over["max_trades_per_day"] = int(v)
+    for name, key in (("GEXBOT_ENTRY_START", "entry_start"),
+                      ("GEXBOT_ENTRY_END", "entry_end"),
+                      ("GEXBOT_FORCE_FLAT", "force_flat")):
+        if v := os.environ.get(name):
+            over[key] = _clock(v, name)
     return _dc.replace(_DEFAULT_PARAMS, **over) if over else _DEFAULT_PARAMS
+
+
+def _clock(raw: str, name: str) -> "dtime":
+    """HH:MM, Central. All times in this bot are Central; there is no other."""
+    from datetime import time as _t
+    try:
+        hh, _, mm = raw.strip().partition(":")
+        return _t(int(hh), int(mm or 0))
+    except (ValueError, TypeError):
+        sys.exit(f"{name} must look like 13:30 (Central), got {raw!r}")
 
 
 def _fraction(raw: str, name: str) -> float:
@@ -1026,6 +1043,28 @@ class Runner:
                         "two stop-outs roughly halve it. Deliberate on a "
                         "challenge account; check GEXBOT_ALLOC_PCT if not.",
                         sz["loss_at_stop_pct"])
+        # Entry window vs. the exit that ends the trade. These only conflict
+        # when the position must close the same day; a contract held overnight
+        # has days for the move to develop, so a late entry is fine.
+        window_min = ((PARAMS.entry_end.hour * 60 + PARAMS.entry_end.minute)
+                      - (PARAMS.entry_start.hour * 60 + PARAMS.entry_start.minute))
+        log.info("entry window %s–%s CT (%dh%02dm)%s",
+                 f"{PARAMS.entry_start:%H:%M}", f"{PARAMS.entry_end:%H:%M}",
+                 window_min // 60, window_min % 60,
+                 f", force-flat {PARAMS.force_flat:%H:%M}"
+                 if PARAMS.must_flatten_today() else ", held overnight — no force-flat")
+        if PARAMS.must_flatten_today():
+            runway = ((PARAMS.force_flat.hour * 60 + PARAMS.force_flat.minute)
+                      - (PARAMS.entry_end.hour * 60 + PARAMS.entry_end.minute))
+            if runway < 60:
+                log.warning("a trade opened at %s has only %d min before the "
+                            "%s force-flat. Short holds lost money at every DTE "
+                            "on the tested sample. Either pull "
+                            "GEXBOT_ENTRY_END earlier, or move to a dated "
+                            "contract with GEXBOT_HOLD_OVERNIGHT=yes.",
+                            f"{PARAMS.entry_end:%H:%M}", max(runway, 0),
+                            f"{PARAMS.force_flat:%H:%M}")
+
         if DAILY_LOSS_LIMIT >= ACCOUNT_VALUE * 0.5:
             log.warning("GEXBOT_DAILY_STOP ($%s) is %.0f%% of the account — it "
                         "will never halt anything. Set it below one stop-out.",
